@@ -1,2 +1,2 @@
 # kubetrace
-eBPF-powered Kubernetes network diagnostics and root-cause investigation.
+Evidence-based Kubernetes network diagnostics using cluster metadata, Cilium/Hubble flows, and optional Linux/eBPF tracing.
