@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "kubetrace.evidence/v1",
+  "collection": {
+    "source": "fixture",
+    "collectedAt": "2026-10-16T12:00:00Z",
+    "status": "complete",
+    "scope": {
+      "namespace": "shop",
+      "serviceName": "checkout"
+    },
+    "endpointSliceListRequest": {
+      "namespace": "shop",
+      "labelSelector": "kubernetes.io/service-name=checkout"
+    }
+  },
+  "service": {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "namespace": "shop",
+      "name": "checkout",
+      "uid": "fixture-service-checkout"
+    },
+    "spec": {
+      "type": "ClusterIP",
+      "selector": {
+        "app": "checkout"
+      }
+    }
+  },
+  "endpointSliceList": {
+    "apiVersion": "discovery.k8s.io/v1",
+    "kind": "EndpointSliceList",
+    "metadata": {
+      "resourceVersion": "101",
+      "continue": ""
+    },
+    "items": [
+      {
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "addressType": "IPv4",
+        "metadata": {
+          "namespace": "shop",
+          "name": "checkout-def34",
+          "labels": {
+            "kubernetes.io/service-name": "checkout"
+          }
+        },
+        "endpoints": [
+          {
+            "addresses": [
+              "10.244.0.11"
+            ],
+            "conditions": {
+              "ready": true
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
