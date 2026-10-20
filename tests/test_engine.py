@@ -518,7 +518,9 @@ def test_normal_report_has_exact_shape_and_cause_text() -> None:
         "ruleId",
         "outcome",
         "summary",
+        "target",
         "service",
+        "collectionIssues",
         "observedEvidence",
         "derivedFindings",
         "possibleCauses",
@@ -533,7 +535,12 @@ def test_normal_report_has_exact_shape_and_cause_text() -> None:
         "EndpointSlice controller data may not have converged.",
     ]
     assert payload["confirmedCauses"] == []
+    assert payload["collectionIssues"] == []
     assert payload["errors"] == []
+    assert payload["target"] == {
+        "namespace": "shop",
+        "serviceName": "checkout",
+    }
     assert payload["observedEvidence"][0]["sourceCollectedAt"] == (
         "2026-10-16T17:30:00+05:30"
     )
@@ -552,7 +559,9 @@ def test_validation_error_report_has_exact_shape() -> None:
         "ruleId",
         "outcome",
         "summary",
+        "target",
         "service",
+        "collectionIssues",
         "errors",
         "observedEvidence",
         "derivedFindings",
@@ -561,6 +570,8 @@ def test_validation_error_report_has_exact_shape() -> None:
         "limitations",
     }
     assert payload["service"] is None
+    assert payload["target"] is None
+    assert payload["collectionIssues"] == []
     assert payload["errors"] == ["bad input"]
     assert payload["outcome"] == "validation_error"
 

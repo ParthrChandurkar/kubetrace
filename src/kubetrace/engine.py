@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from kubetrace.models import (
     EVIDENCE_SCHEMA_VERSION,
     RULE_ID,
+    CollectionIssue,
     CollectionScope,
     DiagnosticReport,
     Endpoint,
@@ -172,6 +173,51 @@ def _timestamp(value: Any, path: str, errors: list[str]) -> tuple[str, str]:
         return timestamp, timestamp
     normalized = parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
     return timestamp, normalized
+
+
+def _normalize_collection_issues(
+    value: Any, status: str, errors: list[str]
+) -> tuple[CollectionIssue, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        errors.append("collection.issues must be a list")
+        return ()
+    if len(value) > MAX_VALIDATION_ERRORS:
+        errors.append(
+            f"collection.issues must contain at most {MAX_VALIDATION_ERRORS} items"
+        )
+        return ()
+
+    issues: list[CollectionIssue] = []
+    for index, item in enumerate(value):
+        path = f"collection.issues[{index}]"
+        issue = _object(item, path, errors)
+        status_value = issue.get("status")
+        if status_value is not None and (
+            not isinstance(status_value, int)
+            or isinstance(status_value, bool)
+            or not 100 <= status_value <= 599
+        ):
+            errors.append(f"{path}.status must be an HTTP status integer or null")
+            status_value = None
+        issues.append(
+            CollectionIssue(
+                operation=_safe_string(
+                    issue.get("operation"), f"{path}.operation", errors, max_length=64
+                ),
+                code=_safe_string(
+                    issue.get("code"), f"{path}.code", errors, max_length=64
+                ),
+                message=_safe_string(
+                    issue.get("message"), f"{path}.message", errors, max_length=256
+                ),
+                status=status_value,
+            )
+        )
+    if issues and status != "incomplete":
+        errors.append("collection.status must be 'incomplete' when issues are present")
+    return tuple(issues)
 
 
 def _normalize_service(value: Any, errors: list[str]) -> Service:
@@ -363,6 +409,9 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
     status = _required_string(collection.get("status"), "collection.status", errors)
     if status not in {"complete", "incomplete"}:
         errors.append("collection.status must be 'complete' or 'incomplete'")
+    collection_issues = _normalize_collection_issues(
+        collection.get("issues"), status, errors
+    )
 
     scope_value = _object(collection.get("scope"), "collection.scope", errors)
     scope = CollectionScope(
@@ -391,7 +440,12 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
                 errors,
             ),
         )
-    service = _normalize_service(raw.get("service"), errors)
+    service_value = raw.get("service")
+    service: Service | None
+    if service_value is None and status == "incomplete" and collection_issues:
+        service = None
+    else:
+        service = _normalize_service(service_value, errors)
 
     list_value = raw.get("endpointSliceList")
     endpoint_slices: tuple[EndpointSlice, ...] | None = None
@@ -441,17 +495,22 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
         raise EvidenceValidationError(errors)
 
     completeness_issues: list[str] = []
+    completeness_issues.extend(
+        f"{issue.operation}: {issue.message}" for issue in collection_issues
+    )
     if status != "complete":
         completeness_issues.append("collection status is incomplete")
-    if scope.namespace != service.namespace or scope.service_name != service.name:
+    if service is not None and (
+        scope.namespace != service.namespace or scope.service_name != service.name
+    ):
         completeness_issues.append(
             "collection scope does not match the Service identity"
         )
-    expected_selector = f"{SERVICE_NAME_LABEL}={service.name}"
+    expected_selector = f"{SERVICE_NAME_LABEL}={scope.service_name}"
     if request is None:
         completeness_issues.append("EndpointSlice list-request provenance is missing")
     else:
-        if request.namespace != service.namespace:
+        if request.namespace != scope.namespace:
             completeness_issues.append(
                 "EndpointSlice list-request namespace does not match the Service"
             )
@@ -475,10 +534,13 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
         if len(identities) != len(set(identities)):
             completeness_issues.append("EndpointSlice identities are duplicated")
         for item in endpoint_slices:
-            if item.namespace != service.namespace or item.service_name != service.name:
+            if (
+                item.namespace != scope.namespace
+                or item.service_name != scope.service_name
+            ):
                 completeness_issues.append(
                     f"EndpointSlice {item.identity} is not associated with "
-                    f"Service {service.identity}"
+                    f"Service {scope.namespace}/{scope.service_name}"
                 )
 
     return EvidenceBundle(
@@ -487,6 +549,7 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
         collected_at=collected_at,
         collection_status=status,
         scope=scope,
+        collection_issues=collection_issues,
         endpoint_slice_request=request,
         service=service,
         endpoint_slices=endpoint_slices,
@@ -530,6 +593,21 @@ def evaluate_service_no_ready_endpoints(
     """Evaluate SERVICE_NO_READY_ENDPOINTS from normalized evidence."""
 
     service = evidence.service
+    if service is None:
+        identity = f"{evidence.scope.namespace}/{evidence.scope.service_name}"
+        return DiagnosticReport(
+            rule_id=RULE_ID,
+            outcome=Outcome.INCONCLUSIVE,
+            summary=f"{RULE_ID}: inconclusive for requested Service {identity}",
+            target=evidence.scope,
+            service=None,
+            collection_issues=evidence.collection_issues,
+            observed_evidence=(),
+            derived_findings=(),
+            possible_causes=(),
+            confirmed_causes=(),
+            limitations=evidence.completeness_issues,
+        )
     service_observation = ObservedEvidence(
         statement=(
             f"Service type is {service.service_type}; "
@@ -550,7 +628,9 @@ def evaluate_service_no_ready_endpoints(
             rule_id=RULE_ID,
             outcome=Outcome.NOT_APPLICABLE,
             summary=f"{RULE_ID}: not applicable to ExternalName {service.identity}",
+            target=evidence.scope,
             service=service,
+            collection_issues=evidence.collection_issues,
             observed_evidence=(service_observation,),
             derived_findings=(
                 "ExternalName Services do not use EndpointSlices for this rule.",
@@ -565,7 +645,9 @@ def evaluate_service_no_ready_endpoints(
             rule_id=RULE_ID,
             outcome=Outcome.INCONCLUSIVE,
             summary=f"{RULE_ID}: inconclusive for Service {service.identity}",
+            target=evidence.scope,
             service=service,
+            collection_issues=evidence.collection_issues,
             observed_evidence=(service_observation,),
             derived_findings=(),
             possible_causes=(),
@@ -612,7 +694,9 @@ def evaluate_service_no_ready_endpoints(
             rule_id=RULE_ID,
             outcome=Outcome.INCONCLUSIVE,
             summary=f"{RULE_ID}: inconclusive for Service {service.identity}",
+            target=evidence.scope,
             service=service,
+            collection_issues=evidence.collection_issues,
             observed_evidence=observations,
             derived_findings=(),
             possible_causes=(),
@@ -628,7 +712,9 @@ def evaluate_service_no_ready_endpoints(
             rule_id=RULE_ID,
             outcome=Outcome.NO_FINDING,
             summary=f"{RULE_ID}: no finding for Service {service.identity}",
+            target=evidence.scope,
             service=service,
+            collection_issues=evidence.collection_issues,
             observed_evidence=observations,
             derived_findings=("At least one logical endpoint is explicitly ready.",),
             possible_causes=(),
@@ -645,7 +731,9 @@ def evaluate_service_no_ready_endpoints(
             rule_id=RULE_ID,
             outcome=Outcome.INCONCLUSIVE,
             summary=f"{RULE_ID}: inconclusive for Service {service.identity}",
+            target=evidence.scope,
             service=service,
+            collection_issues=evidence.collection_issues,
             observed_evidence=observations,
             derived_findings=(),
             possible_causes=(),
@@ -671,7 +759,9 @@ def evaluate_service_no_ready_endpoints(
         rule_id=RULE_ID,
         outcome=Outcome.FINDING,
         summary=f"{RULE_ID}: Service {service.identity} has no ready endpoints",
+        target=evidence.scope,
         service=service,
+        collection_issues=evidence.collection_issues,
         observed_evidence=observations,
         derived_findings=(
             "The complete associated EndpointSlice snapshot contains zero "

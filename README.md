@@ -2,9 +2,11 @@
 
 Evidence-based Kubernetes network diagnostics using cluster metadata, Cilium/Hubble flows, and optional Linux/eBPF tracing.
 
-KubeTrace currently implements one offline, fixture-driven diagnostic rule:
-`SERVICE_NO_READY_ENDPOINTS`. Kubernetes, Cilium/Hubble, and Linux/eBPF live
-collectors are planned evidence sources, not implemented features.
+KubeTrace currently implements one deterministic diagnostic rule,
+`SERVICE_NO_READY_ENDPOINTS`, with fixture input and a unit-tested read-only
+Kubernetes collector. The CLI remains fixture-only. Live-cluster behavior has
+not been validated, and Cilium/Hubble and Linux/eBPF collectors are not
+implemented.
 
 ## Milestone 1
 
@@ -29,8 +31,13 @@ PYTHONPATH=src python3 -m kubetrace fixtures/service-no-ready-endpoints.json
 Valid evidence returns exit status `0`, including findings, inconclusive results,
 and rules that are not applicable. Invalid JSON or structurally invalid evidence
 returns status `2` and a JSON validation-error report. Normal and validation-error
-reports both use `kubetrace.report/v1`; validation errors set `service` to `null`,
+reports both use `kubetrace.report/v2`; validation errors set `service` to `null`,
 populate `errors`, and leave the evidence and cause sections empty.
+
+Report v2 adds an explicit requested `target` and permits `service` to be `null`
+for an inconclusive operational collection where the Kubernetes API did not
+return a Service. It also carries bounded, sanitized `collectionIssues`. This
+avoids presenting requested identity as observed evidence.
 
 ### Evidence-completeness contract
 
@@ -82,6 +89,32 @@ accepts at most:
 These are fixed safety limits for the fixture milestone, not Kubernetes or
 universal deployment limits.
 
+### Kubernetes collector
+
+`KubernetesCollector` accepts injected Core and Discovery API clients; it does
+not load kubeconfig or contact a cluster at import time. It uses only
+`read_namespaced_service` and `list_namespaced_endpoint_slice`, follows all
+pagination tokens, requires one non-empty resource version across pages, and
+projects only fields consumed by the shared normalizer. Partial results and
+bounded structured collection issues are always inconclusive.
+
+Its initial defaults request 100 slices per page and bound one collection to 16
+pages, 256 slices, 10,000 endpoint records, and 15 elapsed seconds. API requests
+also receive a three-second connect and ten-second read timeout. All limits are
+injectable for tests; slice and endpoint budgets cannot exceed the normalizer's
+cardinality limits.
+
+The Kubernetes Python client is optional so fixture-only use remains free of
+runtime dependencies:
+
+```powershell
+python -m pip install ".[kubernetes]"
+```
+
+Installing the extra does not establish cluster reachability, RBAC permission,
+or compatibility. The collector has unit coverage with fake clients; no live
+cluster support claim is made yet.
+
 ### Diagnostic outcomes
 
 - `finding`: complete evidence establishes zero explicitly ready endpoints.
@@ -107,10 +140,12 @@ python -m ruff format --check .
 
 ## Current limitations
 
-- Only JSON fixtures using the source-neutral `kubetrace.evidence/v1` envelope
-  are supported.
+- The CLI accepts only JSON fixtures using the source-neutral
+  `kubetrace.evidence/v1` envelope; the Kubernetes collector is currently a
+  library API.
 - Only `SERVICE_NO_READY_ENDPOINTS` is implemented.
-- Live Kubernetes, Cilium/Hubble, and Linux/eBPF collection is not implemented.
+- Live Kubernetes collection is not validated; Cilium/Hubble and Linux/eBPF
+  collection is not implemented.
 - Service names use the portable RFC-1035 label rule; feature-gated relaxed
   Service-name validation is not modeled.
 - The fixture schema and report schema are versioned but may evolve before the

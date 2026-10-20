@@ -16,11 +16,28 @@ def report_payload(report: DiagnosticReport) -> dict[str, Any]:
         "ruleId": report.rule_id,
         "outcome": report.outcome.value,
         "summary": report.summary,
-        "service": {
-            "namespace": report.service.namespace,
-            "name": report.service.name,
-            "uid": report.service.uid,
+        "target": {
+            "namespace": report.target.namespace,
+            "serviceName": report.target.service_name,
         },
+        "service": (
+            {
+                "namespace": report.service.namespace,
+                "name": report.service.name,
+                "uid": report.service.uid,
+            }
+            if report.service is not None
+            else None
+        ),
+        "collectionIssues": [
+            {
+                "operation": issue.operation,
+                "code": issue.code,
+                "message": issue.message,
+                "status": issue.status,
+            }
+            for issue in report.collection_issues
+        ],
         "observedEvidence": [
             {
                 "statement": item.statement,
@@ -48,7 +65,9 @@ def validation_error_payload(errors: tuple[str, ...]) -> dict[str, Any]:
         "ruleId": RULE_ID,
         "outcome": Outcome.VALIDATION_ERROR.value,
         "summary": "Fixture evidence is invalid.",
+        "target": None,
         "service": None,
+        "collectionIssues": [],
         "errors": list(errors),
         "observedEvidence": [],
         "derivedFindings": [],

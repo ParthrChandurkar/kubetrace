@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 EVIDENCE_SCHEMA_VERSION = "kubetrace.evidence/v1"
-REPORT_SCHEMA_VERSION = "kubetrace.report/v1"
+REPORT_SCHEMA_VERSION = "kubetrace.report/v2"
 RULE_ID = "SERVICE_NO_READY_ENDPOINTS"
 
 
@@ -30,6 +30,14 @@ class CollectionScope:
 class EndpointSliceRequest:
     namespace: str | None
     label_selector: str | None
+
+
+@dataclass(frozen=True)
+class CollectionIssue:
+    operation: str
+    code: str
+    message: str
+    status: int | None
 
 
 @dataclass(frozen=True)
@@ -77,8 +85,9 @@ class EvidenceBundle:
     collected_at: str
     collection_status: str
     scope: CollectionScope
+    collection_issues: tuple[CollectionIssue, ...]
     endpoint_slice_request: EndpointSliceRequest | None
-    service: Service
+    service: Service | None
     endpoint_slices: tuple[EndpointSlice, ...] | None
     endpoint_slice_resource_version: str | None
     endpoint_slice_continue: str | None
@@ -100,7 +109,9 @@ class DiagnosticReport:
     rule_id: str
     outcome: Outcome
     summary: str
-    service: Service
+    target: CollectionScope
+    service: Service | None
+    collection_issues: tuple[CollectionIssue, ...]
     observed_evidence: tuple[ObservedEvidence, ...]
     derived_findings: tuple[str, ...]
     possible_causes: tuple[str, ...]

@@ -35,7 +35,7 @@ def test_cli_checked_in_fixture_outcomes(filename: str, outcome: str, capsys) ->
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert exit_status == 0
-    assert payload["schemaVersion"] == "kubetrace.report/v1"
+    assert payload["schemaVersion"] == "kubetrace.report/v2"
     assert payload["outcome"] == outcome
     assert "SERVICE_NO_READY_ENDPOINTS" in captured.err
 
