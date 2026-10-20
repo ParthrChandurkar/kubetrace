@@ -1,152 +1,193 @@
-# kubetrace
+# KubeTrace
 
-Evidence-based Kubernetes network diagnostics using cluster metadata, Cilium/Hubble flows, and optional Linux/eBPF tracing.
+KubeTrace is a lightweight, evidence-based diagnostic tool for Kubernetes
+networking investigations. It currently evaluates the deterministic
+`SERVICE_NO_READY_ENDPOINTS` rule from either a JSON fixture or read-only
+Kubernetes API evidence.
 
-KubeTrace currently implements one deterministic diagnostic rule,
-`SERVICE_NO_READY_ENDPOINTS`, with fixture input and a unit-tested read-only
-Kubernetes collector. The CLI remains fixture-only. Live-cluster behavior has
-not been validated, and Cilium/Hubble and Linux/eBPF collectors are not
-implemented.
+KubeTrace is not a general-purpose monitoring platform. It produces a bounded,
+versioned diagnostic report that separates observations, derived findings,
+possible causes, confirmed causes, and limitations.
 
-## Milestone 1
+## How it works
 
-The CLI reads a synthetic Service and EndpointSlice collection, normalizes it,
-evaluates the rule, writes a versioned JSON report to standard output, and writes
-a one-line summary to standard error. It uses only the Python standard library
-at runtime and does not require a cluster, containers, network access, or root.
+Both input modes use the same pipeline:
 
-Run it from PowerShell with the Python 3.11 baseline:
+1. A collector obtains Service and EndpointSlice evidence.
+2. The engine validates and normalizes the evidence into typed domain models.
+3. A deterministic rule evaluates the normalized evidence.
+4. The reporter writes versioned JSON to standard output and a terminal-safe
+   one-line summary to standard error.
 
-```powershell
-$env:PYTHONPATH = "src"
-python -m kubetrace fixtures/service-no-ready-endpoints.json
-```
+The Kubernetes collector uses only `read_namespaced_service` and
+`list_namespaced_endpoint_slice`. It follows pagination, requires a consistent
+non-empty resource version, and applies bounded page, slice, endpoint, timeout,
+and elapsed-time limits. Partial or failed collection is reported as
+inconclusive rather than treated as proof of a fault.
 
-From WSL or another POSIX shell:
+## Prerequisites and installation
 
-```sh
-PYTHONPATH=src python3 -m kubetrace fixtures/service-no-ready-endpoints.json
-```
+KubeTrace targets Python 3.11 or newer, with Python 3.11.9 as the tested
+baseline. Fixture mode has no runtime dependencies outside the Python standard
+library.
 
-Valid evidence returns exit status `0`, including findings, inconclusive results,
-and rules that are not applicable. Invalid JSON or structurally invalid evidence
-returns status `2` and a JSON validation-error report. Normal and validation-error
-reports both use `kubetrace.report/v2`; validation errors set `service` to `null`,
-populate `errors`, and leave the evidence and cause sections empty.
-
-Report v2 adds an explicit requested `target` and permits `service` to be `null`
-for an inconclusive operational collection where the Kubernetes API did not
-return a Service. It also carries bounded, sanitized `collectionIssues`. This
-avoids presenting requested identity as observed evidence.
-
-### Evidence-completeness contract
-
-The engine can assert zero ready endpoints only when all of the following hold:
-
-- collection status is `complete`;
-- collection scope matches the Service namespace and name;
-- the recorded EndpointSlice list request uses the Service namespace and exact
-  `kubernetes.io/service-name=<service-name>` label selector;
-- an `EndpointSliceList` is present with a non-empty `resourceVersion`;
-- its pagination `continue` token is absent or empty; and
-- every EndpointSlice has a unique identity and its namespace and
-  `kubernetes.io/service-name` label associate it with the Service.
-
-Request provenance is a collector attestation, not independently verified proof;
-a fixture cannot prove the truth of its own assertions. A future live collector
-must populate these fields from a successfully completed, consistently scoped API
-list operation. Missing, partial, contradictory, or unassociated evidence
-produces an inconclusive result. A truly empty list produces a finding only when
-the entire attested contract is valid.
-
-Endpoint readiness must be explicitly `true` to count as ready. If at least one
-endpoint is explicitly ready, the rule produces no finding. If none is ready and
-any readiness value is missing or `null`, the result is inconclusive. An empty
-complete list or a list containing only explicitly unready endpoints produces a
-finding. The rule applies to selectorless Services using the same endpoint
-evidence, but does not treat the missing selector as a failure. It does not apply
-to `ExternalName` Services.
-
-This explicit-readiness policy is intentionally more conservative than native
-Kubernetes EndpointSlice consumer semantics, which may interpret nil readiness
-as ready. KubeTrace preserves missing or nil readiness as unknown for this rule.
-
-Logical endpoint identity is `(addressType, canonical address)`. Identical
-records are deduplicated, and conflicting readiness for one identity is
-inconclusive. Milestone 1 diagnoses Service-level readiness and does not
-distinguish otherwise identical addresses by EndpointSlice port or protocol.
-
-### Input limits
-
-To bound offline processing on the reference development machine, Milestone 1
-accepts at most:
-
-- 1,048,576 bytes per fixture;
-- 256 EndpointSlices;
-- 10,000 endpoint records; and
-- 50 accumulated validation errors before validation stops.
-
-These are fixed safety limits for the fixture milestone, not Kubernetes or
-universal deployment limits.
-
-### Kubernetes collector
-
-`KubernetesCollector` accepts injected Core and Discovery API clients; it does
-not load kubeconfig or contact a cluster at import time. It uses only
-`read_namespaced_service` and `list_namespaced_endpoint_slice`, follows all
-pagination tokens, requires one non-empty resource version across pages, and
-projects only fields consumed by the shared normalizer. Partial results and
-bounded structured collection issues are always inconclusive.
-
-Its initial defaults request 100 slices per page and bound one collection to 16
-pages, 256 slices, 10,000 endpoint records, and 15 elapsed seconds. API requests
-also receive a three-second connect and ten-second read timeout. All limits are
-injectable for tests; slice and endpoint budgets cannot exceed the normalizer's
-cardinality limits.
-
-The Kubernetes Python client is optional so fixture-only use remains free of
-runtime dependencies:
+From the repository root, install the optional Kubernetes client only when live
+API collection is needed:
 
 ```powershell
 python -m pip install ".[kubernetes]"
 ```
 
-Installing the extra does not establish cluster reachability, RBAC permission,
-or compatibility. The collector has unit coverage with fake clients; no live
-cluster support claim is made yet.
+Installing the extra does not establish cluster reachability, credentials, or
+RBAC permissions. KubeTrace loads the Kubernetes package and kubeconfig only
+when Kubernetes mode is selected.
 
-### Diagnostic outcomes
+## Usage
+
+When running from a source checkout in PowerShell:
+
+```powershell
+$env:PYTHONPATH = "src"
+```
+
+For WSL or another POSIX shell, use `PYTHONPATH=src` before the commands below.
+An installed package also provides the `kubetrace` command.
+
+### Fixture evidence
+
+The original fixture invocation remains supported:
+
+```powershell
+python -m kubetrace fixtures/service-no-ready-endpoints.json
+```
+
+The explicit form is equivalent:
+
+```powershell
+python -m kubetrace fixture fixtures/service-no-ready-endpoints.json
+```
+
+### Kubernetes API evidence
+
+Select one namespaced Service with required namespace and Service arguments:
+
+```powershell
+python -m kubetrace kubernetes --namespace shop --service checkout
+```
+
+By default, the Kubernetes client uses its normal kubeconfig location and
+current context. A different file or context can be selected explicitly:
+
+```powershell
+python -m kubetrace kubernetes --namespace shop --service checkout `
+  --kubeconfig C:\path\to\config --context minikube
+```
+
+KubeTrace does not persist kubeconfig changes. Configuration, authentication,
+authorization, connectivity, and API collection failures are emitted as
+sanitized collection issues; kubeconfig contents, credentials, response bodies,
+and raw exception text are not included in reports.
+
+## Kubernetes permissions
+
+The active identity needs `get` permission for Services and `list` permission
+for EndpointSlices in the target namespace. A namespace-scoped Role can express
+those permissions:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubetrace-reader
+  namespace: shop
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
+```
+
+Binding the Role to an identity is an administrator action and is not performed
+by KubeTrace. The collector does not create, update, patch, or delete Kubernetes
+resources.
+
+## Evidence and diagnostic semantics
+
+The engine can assert zero ready endpoints only when all of the following hold:
+
+- collection status is `complete`;
+- collection scope matches the Service namespace and name;
+- the EndpointSlice list request uses the Service namespace and exact
+  `kubernetes.io/service-name=<service-name>` label selector;
+- an `EndpointSliceList` is present with a non-empty `resourceVersion`;
+- pagination completed without a remaining continuation token; and
+- every EndpointSlice has a unique identity and is associated with the Service.
+
+Endpoint readiness must be explicitly `true` to count as ready. If at least one
+endpoint is explicitly ready, the rule produces no finding. If none is ready and
+any readiness value is missing or `null`, the result is inconclusive. An empty,
+complete list or a list containing only explicitly unready endpoints produces a
+finding. Duplicate logical endpoints are deduplicated; contradictory readiness
+for one identity is inconclusive.
+
+The rule applies to selectorless Services without treating the missing selector
+as a failure. It is not applicable to `ExternalName` Services. The rule observes
+endpoint readiness; it does not confirm why the condition exists.
+
+Diagnostic outcomes are:
 
 - `finding`: complete evidence establishes zero explicitly ready endpoints.
 - `no_finding`: at least one associated endpoint is explicitly ready.
 - `inconclusive`: available evidence cannot establish either result.
 - `not_applicable`: the Service type is outside this rule.
-- `validation_error`: input is malformed or violates the fixture schema.
+- `validation_error`: input is malformed or violates the evidence schema.
 
-Reports keep observed evidence, derived findings, possible causes, and confirmed
-causes separate. This rule observes a condition; it does not confirm why the
-condition exists and emits no numeric confidence score.
+Valid investigations return exit status `0`, including inconclusive and
+not-applicable results. Invalid evidence and structurally invalid collected data
+return status `2`. Command-line usage errors also return status `2`.
+
+## Output
+
+Normal and validation-error reports use `kubetrace.report/v2`. Reports include
+the requested target separately from an observed Service, so a failed Service
+read cannot be presented as observed evidence. Bounded, sanitized
+`collectionIssues` describe operational failures. JSON key ordering and list
+normalization make equivalent reports deterministic, apart from collection
+timestamps obtained at runtime.
+
+## Resource limits
+
+Fixture input is limited to 1,048,576 bytes, 256 EndpointSlices, 10,000 endpoint
+records, and 50 accumulated validation errors.
+
+Kubernetes collection defaults to 100 slices per page and is bounded to 16
+pages, 256 slices, 10,000 endpoint records, and 15 elapsed seconds. Requests use
+a three-second connect timeout and ten-second read timeout.
 
 ## Development checks
 
-Pytest and Ruff are development dependencies declared in `pyproject.toml`; they
-are not runtime dependencies. With those tools available:
+Pytest and Ruff are optional development dependencies declared in
+`pyproject.toml`. With them available:
 
 ```powershell
 python -m pytest
 python -m ruff check .
 python -m ruff format --check .
+python -m compileall -q src tests
+git diff --check
 ```
 
-## Current limitations
+The unit tests use fixtures and fake Kubernetes clients. They do not require a
+cluster, network access, Docker, Minikube, root, or eBPF support.
 
-- The CLI accepts only JSON fixtures using the source-neutral
-  `kubetrace.evidence/v1` envelope; the Kubernetes collector is currently a
-  library API.
+## Limitations
+
 - Only `SERVICE_NO_READY_ENDPOINTS` is implemented.
-- Live Kubernetes collection is not validated; Cilium/Hubble and Linux/eBPF
-  collection is not implemented.
-- Service names use the portable RFC-1035 label rule; feature-gated relaxed
+- Live-cluster compatibility is not covered by the automated test suite.
+- Cilium/Hubble flow collection and Linux/eBPF tracing are not implemented.
+- Service names use the portable RFC 1035 label rule; feature-gated relaxed
   Service-name validation is not modeled.
-- The fixture schema and report schema are versioned but may evolve before the
-  first stable release.
+- The evidence and report schemas are versioned but may evolve before the first
+  stable release.
