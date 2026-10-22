@@ -6,12 +6,16 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Any, Protocol
 
 from kubetrace.engine import (
     MAX_ENDPOINT_SLICES,
     MAX_ENDPOINTS,
+    MAX_PODS,
     SERVICE_NAME_LABEL,
+    SUPPORTED_ADDRESS_TYPES,
+    SUPPORTED_SERVICE_TYPES,
 )
 from kubetrace.models import EVIDENCE_SCHEMA_VERSION
 
@@ -22,6 +26,9 @@ MAX_COLLECTION_ELAPSED_SECONDS = 15.0
 class CoreApiClient(Protocol):
     def read_namespaced_service(self, **kwargs: Any) -> Any:
         """Read one namespaced Service."""
+
+    def list_namespaced_pod(self, **kwargs: Any) -> Any:
+        """List one page of namespaced Pods."""
 
 
 class DiscoveryApiClient(Protocol):
@@ -36,6 +43,7 @@ class CollectionBudgets:
     max_pages: int = MAX_COLLECTION_PAGES
     max_endpoint_slices: int = MAX_ENDPOINT_SLICES
     max_endpoints: int = MAX_ENDPOINTS
+    max_pods: int = MAX_PODS
     max_elapsed_seconds: float = MAX_COLLECTION_ELAPSED_SECONDS
 
     def __post_init__(self) -> None:
@@ -47,6 +55,8 @@ class CollectionBudgets:
             )
         if not 0 <= self.max_endpoints <= MAX_ENDPOINTS:
             raise ValueError(f"max_endpoints must be between 0 and {MAX_ENDPOINTS}")
+        if not 0 <= self.max_pods <= MAX_PODS:
+            raise ValueError(f"max_pods must be between 0 and {MAX_PODS}")
         if not 0 < self.max_elapsed_seconds <= MAX_COLLECTION_ELAPSED_SECONDS:
             raise ValueError(
                 "max_elapsed_seconds must be between 0 and "
@@ -75,7 +85,7 @@ class _MalformedResponse(ValueError):
 
 
 class KubernetesCollector:
-    """Collect minimal Service and EndpointSlice evidence through injected clients."""
+    """Collect minimal Service, EndpointSlice, and Pod evidence."""
 
     def __init__(
         self,
@@ -245,6 +255,18 @@ class KubernetesCollector:
             items.extend(page_items)
             endpoint_count += page_endpoint_count
             if not next_token:
+                pod_collection: dict[str, Any] | None = None
+                pod_list: dict[str, Any] | None = None
+                service_selector = service["spec"]["selector"]
+                if _supports_pod_collection(
+                    self.namespace,
+                    self.service_name,
+                    service,
+                    items,
+                ):
+                    pod_collection, pod_list = self._collect_pods(
+                        started, service_selector
+                    )
                 return self._envelope(
                     collected_at,
                     "complete",
@@ -252,6 +274,8 @@ class KubernetesCollector:
                     self._list_payload(items, resource_version, ""),
                     (),
                     selector,
+                    pod_collection=pod_collection,
+                    pod_list=pod_list,
                 )
             if next_token in seen_tokens:
                 issue = _Issue(
@@ -270,6 +294,141 @@ class KubernetesCollector:
                 )
             seen_tokens.add(next_token)
             continuation = next_token
+
+    def _collect_pods(
+        self, started: float, selector: Mapping[str, str]
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        items: list[dict[str, Any]] = []
+        resource_version: str | None = None
+        continuation: str | None = None
+        seen_tokens: set[str] = set()
+        page_count = 0
+
+        while True:
+            if page_count >= self.budgets.max_pages:
+                issue = _Issue(
+                    "list_pods",
+                    "page_limit",
+                    "Pod collection exceeded its page limit.",
+                )
+                return (
+                    self._pod_collection_payload("incomplete", (issue,)),
+                    self._pod_list_payload(items, resource_version, continuation),
+                )
+            try:
+                self._check_elapsed(started, "list_pods")
+                arguments: dict[str, Any] = {
+                    "namespace": self.namespace,
+                    "label_selector": "",
+                    "limit": self.page_size,
+                    "_request_timeout": self.request_timeout,
+                }
+                if continuation:
+                    arguments["_continue"] = continuation
+                response = self.core_api.list_namespaced_pod(**arguments)
+                self._check_elapsed(started, "list_pods")
+                page = _project_pod_page(response, selector)
+            except Exception as error:
+                issue = self._issue_from_exception("list_pods", error)
+                return (
+                    self._pod_collection_payload("incomplete", (issue,)),
+                    self._pod_list_payload(items, resource_version, continuation),
+                )
+
+            page_count += 1
+            page_resource_version = page["metadata"]["resourceVersion"]
+            next_token = page["metadata"]["continue"]
+            page_items = page["items"]
+
+            if not page_resource_version:
+                issue = _Issue(
+                    "list_pods",
+                    "missing_resource_version",
+                    "Pod list page had no resource version.",
+                )
+                return (
+                    self._pod_collection_payload("incomplete", (issue,)),
+                    self._pod_list_payload(items, resource_version, next_token),
+                )
+            if resource_version is None:
+                resource_version = page_resource_version
+            elif page_resource_version != resource_version:
+                issue = _Issue(
+                    "list_pods",
+                    "resource_version_mismatch",
+                    "Pod list pages did not share one resource version.",
+                )
+                return (
+                    self._pod_collection_payload("incomplete", (issue,)),
+                    self._pod_list_payload(items, resource_version, next_token),
+                )
+            if len(items) + len(page_items) > self.budgets.max_pods:
+                issue = _Issue(
+                    "list_pods",
+                    "pod_limit",
+                    "Pod collection exceeded its Pod limit.",
+                )
+                return (
+                    self._pod_collection_payload("incomplete", (issue,)),
+                    self._pod_list_payload(items, resource_version, next_token),
+                )
+
+            items.extend(page_items)
+            if not next_token:
+                return (
+                    self._pod_collection_payload("complete", ()),
+                    self._pod_list_payload(items, resource_version, ""),
+                )
+            if next_token in seen_tokens:
+                issue = _Issue(
+                    "list_pods",
+                    "repeated_continue_token",
+                    "Pod pagination repeated a continuation token.",
+                )
+                return (
+                    self._pod_collection_payload("incomplete", (issue,)),
+                    self._pod_list_payload(items, resource_version, next_token),
+                )
+            seen_tokens.add(next_token)
+            continuation = next_token
+
+    def _pod_collection_payload(
+        self, status: str, issues: tuple[_Issue, ...]
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "status": status,
+            "request": {
+                "namespace": self.namespace,
+                "labelSelector": "",
+            },
+        }
+        if issues:
+            payload["issues"] = [issue.payload() for issue in issues]
+        return payload
+
+    def _pod_list_payload(
+        self,
+        items: Sequence[dict[str, Any]],
+        resource_version: str | None,
+        continuation: str | None,
+    ) -> dict[str, Any] | None:
+        if resource_version is None and not items:
+            return None
+        return {
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": {
+                "resourceVersion": resource_version,
+                "continue": continuation,
+            },
+            "items": sorted(
+                items,
+                key=lambda item: (
+                    item["metadata"]["namespace"],
+                    item["metadata"]["name"],
+                ),
+            ),
+        }
 
     def _collected_at(self) -> str:
         value = self.clock()
@@ -394,6 +553,9 @@ class KubernetesCollector:
         endpoint_slice_list: dict[str, Any] | None,
         issues: tuple[_Issue, ...],
         selector: str | None = None,
+        *,
+        pod_collection: dict[str, Any] | None = None,
+        pod_list: dict[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         collection: dict[str, Any] = {
             "source": "kubernetes-api",
@@ -411,6 +573,8 @@ class KubernetesCollector:
             }
         if issues:
             collection["issues"] = [issue.payload() for issue in issues]
+        if pod_collection is not None:
+            collection["podListCollection"] = pod_collection
 
         envelope: dict[str, Any] = {
             "schemaVersion": EVIDENCE_SCHEMA_VERSION,
@@ -420,7 +584,59 @@ class KubernetesCollector:
             envelope["service"] = service
         if endpoint_slice_list is not None:
             envelope["endpointSliceList"] = endpoint_slice_list
+        if pod_list is not None:
+            envelope["podList"] = pod_list
         return envelope
+
+
+def _supports_pod_collection(
+    namespace: str,
+    service_name: str,
+    service: Mapping[str, Any],
+    endpoint_slices: Sequence[dict[str, Any]],
+) -> bool:
+    if service.get("apiVersion") != "v1" or service.get("kind") != "Service":
+        return False
+    metadata = service["metadata"]
+    spec = service["spec"]
+    if (
+        metadata["namespace"] != namespace
+        or metadata["name"] != service_name
+        or spec["type"] not in SUPPORTED_SERVICE_TYPES - {"ExternalName"}
+    ):
+        return False
+    selector = spec["selector"]
+    if not selector:
+        return False
+
+    identities: set[tuple[str, str]] = set()
+    for endpoint_slice in endpoint_slices:
+        slice_metadata = endpoint_slice["metadata"]
+        identity = (slice_metadata["namespace"], slice_metadata["name"])
+        address_type = endpoint_slice["addressType"]
+        if (
+            endpoint_slice["apiVersion"] != "discovery.k8s.io/v1"
+            or endpoint_slice["kind"] != "EndpointSlice"
+            or address_type not in SUPPORTED_ADDRESS_TYPES
+            or slice_metadata["namespace"] != namespace
+            or slice_metadata["labels"].get(SERVICE_NAME_LABEL) != service_name
+            or identity in identities
+        ):
+            return False
+        identities.add(identity)
+
+        expected_address = IPv4Address if address_type == "IPv4" else IPv6Address
+        for endpoint in endpoint_slice["endpoints"]:
+            if endpoint["conditions"]["ready"] is not False:
+                return False
+            for address in endpoint["addresses"]:
+                try:
+                    parsed = ip_address(address)
+                except ValueError:
+                    return False
+                if not isinstance(parsed, expected_address):
+                    return False
+    return True
 
 
 def _required_attribute(value: Any, name: str) -> Any:
@@ -546,4 +762,83 @@ def _project_endpoint(value: Any) -> dict[str, Any]:
     return {
         "addresses": sorted(addresses),
         "conditions": {"ready": ready},
+    }
+
+
+def _project_pod_page(value: Any, selector: Mapping[str, str]) -> dict[str, Any]:
+    if (
+        _required_string_attribute(value, "api_version") != "v1"
+        or _required_string_attribute(value, "kind") != "PodList"
+    ):
+        raise _MalformedResponse
+    metadata = _required_attribute(value, "metadata")
+    page_items = _required_attribute(value, "items")
+    if not isinstance(page_items, list):
+        raise _MalformedResponse
+    resource_version = _required_attribute(metadata, "resource_version")
+    continuation = getattr(metadata, "_continue", None)
+    if not isinstance(resource_version, str) or (
+        continuation is not None and not isinstance(continuation, str)
+    ):
+        raise _MalformedResponse
+    return {
+        "metadata": {
+            "resourceVersion": resource_version,
+            "continue": continuation or "",
+        },
+        "items": [_project_pod(item, selector) for item in page_items],
+    }
+
+
+def _project_pod(value: Any, selector: Mapping[str, str]) -> dict[str, Any]:
+    metadata = _required_attribute(value, "metadata")
+    labels_value = getattr(metadata, "labels", None)
+    if labels_value is None:
+        labels: Mapping[str, Any] = {}
+    elif isinstance(labels_value, Mapping):
+        labels = labels_value
+    else:
+        raise _MalformedResponse
+
+    projected_labels: dict[str, str] = {}
+    for key in selector:
+        label_value = labels.get(key)
+        if label_value is not None:
+            if not isinstance(label_value, str):
+                raise _MalformedResponse
+            projected_labels[key] = label_value
+
+    status = getattr(value, "status", None)
+    conditions = None if status is None else getattr(status, "conditions", None)
+    if conditions is None:
+        ready = None
+    else:
+        if not isinstance(conditions, list):
+            raise _MalformedResponse
+        ready_values: list[bool | None] = []
+        for condition in conditions:
+            condition_type = _required_string_attribute(condition, "type")
+            if condition_type != "Ready":
+                continue
+            condition_status = _required_string_attribute(condition, "status")
+            try:
+                ready_values.append(
+                    {"True": True, "False": False, "Unknown": None}[condition_status]
+                )
+            except KeyError as error:
+                raise _MalformedResponse from error
+        if len(ready_values) > 1:
+            raise _MalformedResponse
+        ready = ready_values[0] if ready_values else None
+
+    return {
+        "apiVersion": _required_string_attribute(value, "api_version"),
+        "kind": _required_string_attribute(value, "kind"),
+        "metadata": {
+            "namespace": _required_string_attribute(metadata, "namespace"),
+            "name": _required_string_attribute(metadata, "name"),
+            "uid": _required_string_attribute(metadata, "uid"),
+            "labels": projected_labels,
+        },
+        "status": {"ready": ready},
     }

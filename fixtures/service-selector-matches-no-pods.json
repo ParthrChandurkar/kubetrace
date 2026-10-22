@@ -1,0 +1,72 @@
+{
+  "schemaVersion": "kubetrace.evidence/v1",
+  "collection": {
+    "source": "fixture",
+    "collectedAt": "2026-10-22T12:00:00Z",
+    "status": "complete",
+    "scope": {
+      "namespace": "shop",
+      "serviceName": "checkout"
+    },
+    "endpointSliceListRequest": {
+      "namespace": "shop",
+      "labelSelector": "kubernetes.io/service-name=checkout"
+    },
+    "podListCollection": {
+      "status": "complete",
+      "request": {
+        "namespace": "shop",
+        "labelSelector": ""
+      }
+    }
+  },
+  "service": {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {
+      "namespace": "shop",
+      "name": "checkout",
+      "uid": "fixture-service-checkout"
+    },
+    "spec": {
+      "type": "ClusterIP",
+      "selector": {
+        "app": "checkout"
+      }
+    }
+  },
+  "endpointSliceList": {
+    "apiVersion": "discovery.k8s.io/v1",
+    "kind": "EndpointSliceList",
+    "metadata": {
+      "resourceVersion": "100",
+      "continue": ""
+    },
+    "items": []
+  },
+  "podList": {
+    "apiVersion": "v1",
+    "kind": "PodList",
+    "metadata": {
+      "resourceVersion": "200",
+      "continue": ""
+    },
+    "items": [
+      {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+          "namespace": "shop",
+          "name": "catalog-abc12",
+          "uid": "fixture-pod-catalog",
+          "labels": {
+            "app": "catalog"
+          }
+        },
+        "status": {
+          "ready": true
+        }
+      }
+    ]
+  }
+}

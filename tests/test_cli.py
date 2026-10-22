@@ -42,6 +42,8 @@ def write_fixture(tmp_path: Path, evidence: dict[str, Any]) -> Path:
     [
         ("service-no-ready-endpoints.json", "finding"),
         ("service-with-ready-endpoint.json", "no_finding"),
+        ("service-selector-matches-no-pods.json", "finding"),
+        ("service-matching-pods-not-ready.json", "finding"),
     ],
 )
 def test_cli_checked_in_fixture_outcomes(filename: str, outcome: str, capsys) -> None:
@@ -271,6 +273,7 @@ def test_kubernetes_mode_runs_with_mocked_config_and_api_clients(
 ) -> None:
     config_calls: list[dict[str, Any]] = []
     service_calls: list[dict[str, Any]] = []
+    pod_calls: list[dict[str, Any]] = []
     slice_calls: list[dict[str, Any]] = []
     api_client = SimpleNamespace(closed=False)
     api_client.close = lambda: setattr(api_client, "closed", True)
@@ -295,11 +298,21 @@ def test_kubernetes_mode_runs_with_mocked_config_and_api_clients(
         metadata=SimpleNamespace(resource_version="100", _continue=""),
         items=[],
     )
+    pod_page = SimpleNamespace(
+        api_version="v1",
+        kind="PodList",
+        metadata=SimpleNamespace(resource_version="200", _continue=""),
+        items=[],
+    )
 
     class CoreApi:
         def read_namespaced_service(self, **kwargs: Any) -> Any:
             service_calls.append(kwargs)
             return service
+
+        def list_namespaced_pod(self, **kwargs: Any) -> Any:
+            pod_calls.append(kwargs)
+            return pod_page
 
     class DiscoveryApi:
         def list_namespaced_endpoint_slice(self, **kwargs: Any) -> Any:
@@ -340,6 +353,14 @@ def test_kubernetes_mode_runs_with_mocked_config_and_api_clients(
         {
             "namespace": "shop",
             "label_selector": "kubernetes.io/service-name=checkout",
+            "limit": 100,
+            "_request_timeout": (3.0, 10.0),
+        }
+    ]
+    assert pod_calls == [
+        {
+            "namespace": "shop",
+            "label_selector": "",
             "limit": 100,
             "_request_timeout": (3.0, 10.0),
         }

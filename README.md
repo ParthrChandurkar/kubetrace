@@ -3,7 +3,9 @@
 KubeTrace is a lightweight, evidence-based diagnostic tool for Kubernetes
 networking investigations. It currently evaluates the deterministic
 `SERVICE_NO_READY_ENDPOINTS` rule from either a JSON fixture or read-only
-Kubernetes API evidence.
+Kubernetes API evidence. When a selector-based Service has no ready endpoints,
+optional Pod evidence can identify a bounded selector or readiness condition
+without asserting why that condition occurred.
 
 KubeTrace is not a general-purpose monitoring platform. It produces a bounded,
 versioned diagnostic report that separates observations, derived findings,
@@ -13,17 +15,19 @@ possible causes, confirmed causes, and limitations.
 
 Both input modes use the same pipeline:
 
-1. A collector obtains Service and EndpointSlice evidence.
+1. A collector obtains Service, EndpointSlice, and—when needed—Pod evidence.
 2. The engine validates and normalizes the evidence into typed domain models.
 3. A deterministic rule evaluates the normalized evidence.
 4. The reporter writes versioned JSON to standard output and a terminal-safe
    one-line summary to standard error.
 
-The Kubernetes collector uses only `read_namespaced_service` and
-`list_namespaced_endpoint_slice`. It follows pagination, requires a consistent
-non-empty resource version, and applies bounded page, slice, endpoint, timeout,
-and elapsed-time limits. Partial or failed collection is reported as
-inconclusive rather than treated as proof of a fault.
+The Kubernetes collector uses only `read_namespaced_service`,
+`list_namespaced_endpoint_slice`, and `list_namespaced_pod`. It follows
+pagination, requires a consistent non-empty resource version for each list, and
+applies bounded page, object, timeout, and elapsed-time limits. Pod collection
+is attempted only after complete EndpointSlice evidence establishes zero ready
+endpoints for a selector-based Service. Partial or failed evidence is never
+treated as proof of a cause.
 
 ## Prerequisites and installation
 
@@ -91,8 +95,8 @@ and raw exception text are not included in reports.
 ## Kubernetes permissions
 
 The active identity needs `get` permission for Services and `list` permission
-for EndpointSlices in the target namespace. A namespace-scoped Role can express
-those permissions:
+for EndpointSlices and Pods in the target namespace. A namespace-scoped Role
+can express those permissions:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -104,6 +108,9 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list"]
@@ -136,6 +143,25 @@ The rule applies to selectorless Services without treating the missing selector
 as a failure. It is not applicable to `ExternalName` Services. The rule observes
 endpoint readiness; it does not confirm why the condition exists.
 
+For a selector-based Service with a confirmed no-ready-endpoints finding, a
+complete namespace-scoped Pod snapshot can additionally establish one of these
+bounded conditions:
+
+- no Pods were observed in the namespace;
+- the Service selector matched none of the observed Pods; or
+- every matching Pod explicitly reported `Ready=False`.
+
+These are derived conditions that narrow the possible causes. Observing no Pods
+or no selector matches is never reported as a confirmed root cause because the
+evidence cannot establish workload intent. Only the all-matching-Pods-unready
+condition is included in `confirmedCauses`, and it confirms the immediate
+readiness condition rather than why readiness checks fail. A matching
+`Ready=True` Pod contradicts the EndpointSlice snapshot, while missing or
+unknown Pod readiness is insufficient to confirm an unready-Pod cause.
+Incomplete Pod collection leaves `confirmedCauses` empty and records collection
+issues and limitations; it does not erase a no-ready-endpoints finding already
+established from complete EndpointSlice evidence.
+
 Diagnostic outcomes are:
 
 - `finding`: complete evidence establishes zero explicitly ready endpoints.
@@ -162,9 +188,11 @@ timestamps obtained at runtime.
 Fixture input is limited to 1,048,576 bytes, 256 EndpointSlices, 10,000 endpoint
 records, and 50 accumulated validation errors.
 
-Kubernetes collection defaults to 100 slices per page and is bounded to 16
-pages, 256 slices, 10,000 endpoint records, and 15 elapsed seconds. Requests use
-a three-second connect timeout and ten-second read timeout.
+Kubernetes collection defaults to 100 objects per page. Each paginated list is
+bounded to 16 pages; collection is additionally bounded to 256 EndpointSlices,
+10,000 endpoint records, 1,000 Pods, and 15 elapsed seconds. Requests use a
+three-second connect timeout and ten-second read timeout. Pod evidence retains
+only identity, the Service selector's label keys, and the Pod Ready condition.
 
 ## Development checks
 

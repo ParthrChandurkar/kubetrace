@@ -39,15 +39,24 @@ class FakeApiError(Exception):
 
 
 class FakeCoreApi:
-    def __init__(self, response: Any) -> None:
+    def __init__(self, response: Any, pod_responses: list[Any]) -> None:
         self.response = response
+        self.pod_responses = iter(pod_responses)
         self.calls: list[dict[str, Any]] = []
+        self.pod_calls: list[dict[str, Any]] = []
 
     def read_namespaced_service(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         if isinstance(self.response, Exception):
             raise self.response
         return self.response
+
+    def list_namespaced_pod(self, **kwargs: Any) -> Any:
+        self.pod_calls.append(kwargs)
+        response = next(self.pod_responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class FakeDiscoveryApi:
@@ -135,14 +144,61 @@ def page(
     )
 
 
+def pod(
+    name: str,
+    label: str,
+    ready: str | None,
+) -> SimpleNamespace:
+    conditions = [] if ready is None else [SimpleNamespace(type="Ready", status=ready)]
+    return SimpleNamespace(
+        api_version="v1",
+        kind="Pod",
+        metadata=SimpleNamespace(
+            namespace="shop",
+            name=name,
+            uid=f"pod-{name}",
+            labels={
+                "app": label,
+                "sensitive.example/label": "must-not-be-collected",
+            },
+            annotations={"credential": "must-not-be-collected"},
+        ),
+        status=SimpleNamespace(
+            conditions=conditions,
+            container_statuses=["must-not-be-collected"],
+        ),
+        spec=SimpleNamespace(containers=["must-not-be-collected"]),
+    )
+
+
+def pod_page(
+    resource_version: str | None,
+    continuation: str,
+    items: list[SimpleNamespace],
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        api_version="v1",
+        kind="PodList",
+        metadata=SimpleNamespace(
+            resource_version=resource_version,
+            _continue=continuation,
+        ),
+        items=items,
+    )
+
+
 def collector(
     responses: list[Any],
     *,
     core_response: Any | None = None,
+    pod_responses: list[Any] | None = None,
     budgets: CollectionBudgets | None = None,
     monotonic_clock=lambda: 0.0,
 ) -> tuple[KubernetesCollector, FakeCoreApi, FakeDiscoveryApi]:
-    core = FakeCoreApi(service() if core_response is None else core_response)
+    core = FakeCoreApi(
+        service() if core_response is None else core_response,
+        [pod_page("200", "", [])] if pod_responses is None else pod_responses,
+    )
     discovery = FakeDiscoveryApi(responses)
     instance = KubernetesCollector(
         core,
@@ -160,6 +216,10 @@ def collector(
 
 def issue_code(evidence: dict[str, Any]) -> str:
     return evidence["collection"]["issues"][0]["code"]
+
+
+def pod_issue_code(evidence: dict[str, Any]) -> str:
+    return evidence["collection"]["podListCollection"]["issues"][0]["code"]
 
 
 def test_single_page_collection_uses_exact_read_only_arguments() -> None:
@@ -182,6 +242,14 @@ def test_single_page_collection_uses_exact_read_only_arguments() -> None:
             "_request_timeout": TIMEOUT,
         }
     ]
+    assert core.pod_calls == [
+        {
+            "namespace": "shop",
+            "label_selector": "",
+            "limit": 2,
+            "_request_timeout": TIMEOUT,
+        }
+    ]
     assert evidence["collection"]["status"] == "complete"
     assert evidence["collection"]["endpointSliceListRequest"] == {
         "namespace": "shop",
@@ -189,6 +257,14 @@ def test_single_page_collection_uses_exact_read_only_arguments() -> None:
     }
     assert evidence["endpointSliceList"]["metadata"] == {
         "resourceVersion": "100",
+        "continue": "",
+    }
+    assert evidence["collection"]["podListCollection"] == {
+        "status": "complete",
+        "request": {"namespace": "shop", "labelSelector": ""},
+    }
+    assert evidence["podList"]["metadata"] == {
+        "resourceVersion": "200",
         "continue": "",
     }
 
@@ -230,6 +306,250 @@ def test_empty_complete_list_flows_to_finding() -> None:
 
     assert report.outcome is Outcome.FINDING
     assert report.rule_id == "SERVICE_NO_READY_ENDPOINTS"
+
+
+def test_multi_page_pod_collection_is_unfiltered_and_confirms_unready_pods() -> None:
+    instance, core, _ = collector(
+        [page("100", "", [])],
+        pod_responses=[
+            pod_page("200", "pod-token", [pod("checkout-b", "checkout", "False")]),
+            pod_page("200", "", [pod("checkout-a", "checkout", "False")]),
+        ],
+    )
+
+    evidence = dict(instance.collect())
+    report = diagnose(evidence)
+
+    assert core.pod_calls == [
+        {
+            "namespace": "shop",
+            "label_selector": "",
+            "limit": 2,
+            "_request_timeout": TIMEOUT,
+        },
+        {
+            "namespace": "shop",
+            "label_selector": "",
+            "limit": 2,
+            "_request_timeout": TIMEOUT,
+            "_continue": "pod-token",
+        },
+    ]
+    assert [item["metadata"]["name"] for item in evidence["podList"]["items"]] == [
+        "checkout-a",
+        "checkout-b",
+    ]
+    assert report.confirmed_causes == (
+        "All 2 Pods matching the Service selector explicitly reported Ready=False "
+        "during the bounded collection.",
+    )
+
+
+@pytest.mark.parametrize("endpoint_ready", [True, None])
+def test_pod_collection_is_skipped_when_endpoint_result_is_not_a_finding(
+    endpoint_ready: bool | None,
+) -> None:
+    item = endpoint_slice("checkout-a", [endpoint("10.0.0.1", endpoint_ready)])
+    instance, core, _ = collector([page("100", "", [item])])
+
+    evidence = dict(instance.collect())
+
+    assert core.pod_calls == []
+    assert "podListCollection" not in evidence["collection"]
+    assert "podList" not in evidence
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "service-identity",
+        "service-type",
+        "slice-association",
+        "duplicate-slice",
+        "invalid-address",
+        "address-type-mismatch",
+    ],
+)
+def test_pod_collection_requires_valid_complete_endpoint_evidence(
+    mutation: str,
+) -> None:
+    observed_service = service()
+    item = endpoint_slice("checkout-a", [endpoint("10.0.0.1", False)])
+    items = [item]
+    if mutation == "service-identity":
+        observed_service.metadata.name = "other"
+    elif mutation == "service-type":
+        observed_service.spec.type = "Unsupported"
+    elif mutation == "slice-association":
+        item.metadata.labels["kubernetes.io/service-name"] = "other"
+    elif mutation == "duplicate-slice":
+        items.append(endpoint_slice("checkout-a", []))
+    elif mutation == "invalid-address":
+        item.endpoints[0].addresses = ["not-an-ip"]
+    else:
+        item.address_type = "IPv6"
+
+    instance, core, _ = collector(
+        [page("100", "", items)], core_response=observed_service
+    )
+
+    evidence = dict(instance.collect())
+
+    assert core.pod_calls == []
+    assert "podListCollection" not in evidence["collection"]
+    assert "podList" not in evidence
+
+
+@pytest.mark.parametrize(
+    ("pod_responses", "budgets", "expected_code"),
+    [
+        (
+            [pod_page("", "", [])],
+            None,
+            "missing_resource_version",
+        ),
+        (
+            [pod_page("200", "next", []), pod_page("201", "", [])],
+            None,
+            "resource_version_mismatch",
+        ),
+        (
+            [pod_page("200", "same", []), pod_page("200", "same", [])],
+            None,
+            "repeated_continue_token",
+        ),
+        (
+            [pod_page("200", "next", [])],
+            CollectionBudgets(max_pages=1),
+            "page_limit",
+        ),
+        (
+            [pod_page("200", "", [pod("checkout-a", "checkout", "False")])],
+            CollectionBudgets(max_pods=0),
+            "pod_limit",
+        ),
+    ],
+)
+def test_pod_pagination_and_cardinality_failures_do_not_confirm_cause(
+    pod_responses: list[Any],
+    budgets: CollectionBudgets | None,
+    expected_code: str,
+) -> None:
+    instance, _, _ = collector(
+        [page("100", "", [])],
+        pod_responses=pod_responses,
+        budgets=budgets,
+    )
+
+    evidence = dict(instance.collect())
+    report = diagnose(evidence)
+
+    assert pod_issue_code(evidence) == expected_code
+    assert evidence["collection"]["status"] == "complete"
+    assert evidence["collection"]["podListCollection"]["status"] == "incomplete"
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == ()
+
+
+def test_pod_failure_after_successful_page_cannot_use_partial_evidence() -> None:
+    instance, _, _ = collector(
+        [page("100", "", [])],
+        pod_responses=[
+            pod_page("200", "next", [pod("checkout-a", "checkout", "False")]),
+            FakeApiError(403),
+        ],
+    )
+
+    evidence = dict(instance.collect())
+    report = diagnose(evidence)
+
+    assert evidence["podList"]["metadata"]["continue"] == "next"
+    assert pod_issue_code(evidence) == "forbidden"
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == ()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (FakeApiError(401), "unauthorized"),
+        (FakeApiError(403), "forbidden"),
+        (FakeApiError(410), "pagination_expired"),
+        (TimeoutError("sensitive timeout detail"), "timeout"),
+        (OSError("sensitive transport detail"), "transport_error"),
+    ],
+)
+def test_pod_api_failures_are_sanitized_and_do_not_confirm_cause(
+    error: Exception, expected_code: str
+) -> None:
+    instance, _, _ = collector([page("100", "", [])], pod_responses=[error])
+
+    evidence = dict(instance.collect())
+    serialized = json.dumps(evidence)
+    report = diagnose(evidence)
+
+    assert pod_issue_code(evidence) == expected_code
+    assert "sensitive" not in serialized
+    assert "secret response body" not in serialized
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == ()
+
+
+def test_pod_elapsed_time_limit_does_not_confirm_cause() -> None:
+    times: Iterator[float] = iter([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0])
+    instance, _, _ = collector(
+        [page("100", "", [])],
+        pod_responses=[pod_page("200", "", [])],
+        budgets=CollectionBudgets(max_elapsed_seconds=1.0),
+        monotonic_clock=lambda: next(times),
+    )
+
+    evidence = dict(instance.collect())
+
+    assert pod_issue_code(evidence) == "timeout"
+    assert diagnose(evidence).confirmed_causes == ()
+
+
+def test_pod_projection_keeps_only_selector_labels_and_ready_condition() -> None:
+    instance, _, _ = collector(
+        [page("100", "", [])],
+        pod_responses=[pod_page("200", "", [pod("checkout-a", "checkout", "False")])],
+    )
+
+    evidence = dict(instance.collect())
+    serialized = json.dumps(evidence)
+    projected = evidence["podList"]["items"][0]
+
+    assert projected["metadata"]["labels"] == {"app": "checkout"}
+    assert projected["status"] == {"ready": False}
+    assert "annotations" not in serialized
+    assert "must-not-be-collected" not in serialized
+    assert "container_statuses" not in serialized
+    assert "spec" not in projected
+
+
+def test_malformed_pod_response_does_not_confirm_cause() -> None:
+    malformed = SimpleNamespace(metadata=None, items=None)
+    instance, _, _ = collector([page("100", "", [])], pod_responses=[malformed])
+
+    evidence = dict(instance.collect())
+
+    assert pod_issue_code(evidence) == "invalid_response"
+    assert diagnose(evidence).confirmed_causes == ()
+
+
+def test_contradictory_pod_ready_conditions_do_not_confirm_cause() -> None:
+    item = pod("checkout-a", "checkout", "False")
+    item.status.conditions.append(SimpleNamespace(type="Ready", status="True"))
+    instance, _, _ = collector(
+        [page("100", "", [])],
+        pod_responses=[pod_page("200", "", [item])],
+    )
+
+    evidence = dict(instance.collect())
+
+    assert pod_issue_code(evidence) == "invalid_response"
+    assert diagnose(evidence).confirmed_causes == ()
 
 
 def test_resource_version_mismatch_is_inconclusive() -> None:
@@ -422,12 +742,24 @@ def test_readiness_values_use_shared_rule(
 
 def test_external_name_skips_endpoint_slice_collection() -> None:
     external = service(service_type="ExternalName", external_name="api.example.test")
-    instance, _, discovery = collector([], core_response=external)
+    instance, core, discovery = collector([], core_response=external)
 
     report = run_diagnostic(instance)
 
     assert report.outcome is Outcome.NOT_APPLICABLE
     assert discovery.calls == []
+    assert core.pod_calls == []
+
+
+def test_selectorless_service_skips_pod_collection() -> None:
+    selectorless = service()
+    selectorless.spec.selector = None
+    instance, core, _ = collector([page("100", "", [])], core_response=selectorless)
+
+    report = run_diagnostic(instance)
+
+    assert report.outcome is Outcome.FINDING
+    assert core.pod_calls == []
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,4 @@
-"""Typed domain models for the fixture-driven diagnostic pipeline."""
+"""Typed domain models for the diagnostic pipeline."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ RULE_ID = "SERVICE_NO_READY_ENDPOINTS"
 
 
 class Outcome(StrEnum):
-    """Stable diagnostic outcomes emitted by Milestone 1."""
+    """Stable diagnostic outcomes emitted by the engine."""
 
     FINDING = "finding"
     NO_FINDING = "no_finding"
@@ -28,6 +28,12 @@ class CollectionScope:
 
 @dataclass(frozen=True)
 class EndpointSliceRequest:
+    namespace: str | None
+    label_selector: str | None
+
+
+@dataclass(frozen=True)
+class PodListRequest:
     namespace: str | None
     label_selector: str | None
 
@@ -79,6 +85,30 @@ class EndpointSlice:
 
 
 @dataclass(frozen=True)
+class Pod:
+    namespace: str
+    name: str
+    uid: str
+    labels: tuple[tuple[str, str], ...]
+    ready: bool | None
+
+    @property
+    def identity(self) -> str:
+        return f"{self.namespace}/{self.name}"
+
+
+@dataclass(frozen=True)
+class PodEvidence:
+    collection_status: str
+    collection_issues: tuple[CollectionIssue, ...]
+    request: PodListRequest | None
+    pods: tuple[Pod, ...] | None
+    resource_version: str | None
+    continue_token: str | None
+    completeness_issues: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class EvidenceBundle:
     source: str
     source_collected_at: str
@@ -92,6 +122,7 @@ class EvidenceBundle:
     endpoint_slice_resource_version: str | None
     endpoint_slice_continue: str | None
     completeness_issues: tuple[str, ...]
+    pod_evidence: PodEvidence | None
 
 
 @dataclass(frozen=True)

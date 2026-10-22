@@ -22,6 +22,9 @@ from kubetrace.models import (
     EvidenceBundle,
     ObservedEvidence,
     Outcome,
+    Pod,
+    PodEvidence,
+    PodListRequest,
     Service,
 )
 
@@ -34,6 +37,7 @@ SUPPORTED_SERVICE_TYPES = frozenset(
 MAX_FIXTURE_BYTES = 1_048_576
 MAX_ENDPOINT_SLICES = 256
 MAX_ENDPOINTS = 10_000
+MAX_PODS = 1_000
 MAX_VALIDATION_ERRORS = 50
 
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
@@ -176,47 +180,52 @@ def _timestamp(value: Any, path: str, errors: list[str]) -> tuple[str, str]:
 
 
 def _normalize_collection_issues(
-    value: Any, status: str, errors: list[str]
+    value: Any, status: str, errors: list[str], *, path: str = "collection.issues"
 ) -> tuple[CollectionIssue, ...]:
     if value is None:
         return ()
     if not isinstance(value, list):
-        errors.append("collection.issues must be a list")
+        errors.append(f"{path} must be a list")
         return ()
     if len(value) > MAX_VALIDATION_ERRORS:
-        errors.append(
-            f"collection.issues must contain at most {MAX_VALIDATION_ERRORS} items"
-        )
+        errors.append(f"{path} must contain at most {MAX_VALIDATION_ERRORS} items")
         return ()
 
     issues: list[CollectionIssue] = []
     for index, item in enumerate(value):
-        path = f"collection.issues[{index}]"
-        issue = _object(item, path, errors)
+        item_path = f"{path}[{index}]"
+        issue = _object(item, item_path, errors)
         status_value = issue.get("status")
         if status_value is not None and (
             not isinstance(status_value, int)
             or isinstance(status_value, bool)
             or not 100 <= status_value <= 599
         ):
-            errors.append(f"{path}.status must be an HTTP status integer or null")
+            errors.append(f"{item_path}.status must be an HTTP status integer or null")
             status_value = None
         issues.append(
             CollectionIssue(
                 operation=_safe_string(
-                    issue.get("operation"), f"{path}.operation", errors, max_length=64
+                    issue.get("operation"),
+                    f"{item_path}.operation",
+                    errors,
+                    max_length=64,
                 ),
                 code=_safe_string(
-                    issue.get("code"), f"{path}.code", errors, max_length=64
+                    issue.get("code"), f"{item_path}.code", errors, max_length=64
                 ),
                 message=_safe_string(
-                    issue.get("message"), f"{path}.message", errors, max_length=256
+                    issue.get("message"),
+                    f"{item_path}.message",
+                    errors,
+                    max_length=256,
                 ),
                 status=status_value,
             )
         )
     if issues and status != "incomplete":
-        errors.append("collection.status must be 'incomplete' when issues are present")
+        status_path = path.removesuffix(".issues") + ".status"
+        errors.append(f"{status_path} must be 'incomplete' when issues are present")
     return tuple(issues)
 
 
@@ -377,6 +386,63 @@ def _normalize_endpoint_slice(
     )
 
 
+def _normalize_pod(value: Any, index: int, errors: list[str]) -> Pod:
+    path = f"podList.items[{index}]"
+    pod = _object(value, path, errors)
+    if pod.get("apiVersion") != "v1":
+        errors.append(f"{path}.apiVersion must be 'v1'")
+    if pod.get("kind") != "Pod":
+        errors.append(f"{path}.kind must be 'Pod'")
+
+    metadata = _object(pod.get("metadata"), f"{path}.metadata", errors)
+    labels_value = metadata.get("labels")
+    labels: list[tuple[str, str]] = []
+    if not isinstance(labels_value, dict):
+        errors.append(f"{path}.metadata.labels must be an object")
+    else:
+        for key, label_value in labels_value.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or len(key) > 253
+                or not key.isprintable()
+            ):
+                errors.append(
+                    f"{path}.metadata.labels keys must be non-empty printable "
+                    "strings of at most 253 characters"
+                )
+                continue
+            if (
+                not isinstance(label_value, str)
+                or len(label_value) > 63
+                or not label_value.isprintable()
+            ):
+                errors.append(
+                    f"{path}.metadata.labels.{key} must be a printable string "
+                    "of at most 63 characters"
+                )
+                continue
+            labels.append((key, label_value))
+
+    status = _object(pod.get("status"), f"{path}.status", errors)
+    ready_value = status.get("ready")
+    if ready_value is None or isinstance(ready_value, bool):
+        ready = ready_value
+    else:
+        errors.append(f"{path}.status.ready must be true, false, or null")
+        ready = None
+
+    return Pod(
+        namespace=_dns_label(
+            metadata.get("namespace"), f"{path}.metadata.namespace", errors
+        ),
+        name=_dns_subdomain(metadata.get("name"), f"{path}.metadata.name", errors),
+        uid=_safe_string(metadata.get("uid"), f"{path}.metadata.uid", errors),
+        labels=tuple(sorted(labels)),
+        ready=ready,
+    )
+
+
 def _validate_collection_limits(items: Any) -> None:
     if not isinstance(items, list):
         return
@@ -392,6 +458,140 @@ def _validate_collection_limits(items: Any) -> None:
                 raise EvidenceValidationError(
                     [f"endpoint count exceeds the {MAX_ENDPOINTS}-endpoint limit"]
                 )
+
+
+def _validate_pod_limit(items: Any) -> None:
+    if isinstance(items, list) and len(items) > MAX_PODS:
+        raise EvidenceValidationError([f"Pod count exceeds the {MAX_PODS}-Pod limit"])
+
+
+def _normalize_pod_evidence(
+    raw: Mapping[str, Any],
+    collection: dict[str, Any],
+    scope: CollectionScope,
+    errors: list[str],
+) -> PodEvidence | None:
+    collection_value = collection.get("podListCollection")
+    list_value = raw.get("podList")
+    if collection_value is None and list_value is None:
+        return None
+
+    pod_collection = _object(collection_value, "collection.podListCollection", errors)
+    status = _required_string(
+        pod_collection.get("status"),
+        "collection.podListCollection.status",
+        errors,
+    )
+    if status not in {"complete", "incomplete"}:
+        errors.append(
+            "collection.podListCollection.status must be 'complete' or 'incomplete'"
+        )
+    issues = _normalize_collection_issues(
+        pod_collection.get("issues"),
+        status,
+        errors,
+        path="collection.podListCollection.issues",
+    )
+
+    request_value = pod_collection.get("request")
+    request: PodListRequest | None = None
+    if request_value is not None:
+        request_object = _object(
+            request_value, "collection.podListCollection.request", errors
+        )
+        request = PodListRequest(
+            namespace=_optional_string(
+                request_object.get("namespace"),
+                "collection.podListCollection.request.namespace",
+                errors,
+            ),
+            label_selector=_optional_string(
+                request_object.get("labelSelector"),
+                "collection.podListCollection.request.labelSelector",
+                errors,
+            ),
+        )
+
+    pods: tuple[Pod, ...] | None = None
+    resource_version: str | None = None
+    continue_token: str | None = None
+    if list_value is not None:
+        pod_list = _object(list_value, "podList", errors)
+        if pod_list.get("apiVersion") != "v1":
+            errors.append("podList.apiVersion must be 'v1'")
+        if pod_list.get("kind") != "PodList":
+            errors.append("podList.kind must be 'PodList'")
+        metadata = _object(pod_list.get("metadata"), "podList.metadata", errors)
+        resource_version = _optional_string(
+            metadata.get("resourceVersion"),
+            "podList.metadata.resourceVersion",
+            errors,
+        )
+        if resource_version is not None and not resource_version.isprintable():
+            errors.append("podList.metadata.resourceVersion must be printable")
+        continue_token = _optional_string(
+            metadata.get("continue"), "podList.metadata.continue", errors
+        )
+        if continue_token is not None and not continue_token.isprintable():
+            errors.append("podList.metadata.continue must be printable")
+        items = pod_list.get("items")
+        _validate_pod_limit(items)
+        if isinstance(items, list):
+            pods = tuple(
+                sorted(
+                    (
+                        _normalize_pod(item, index, errors)
+                        for index, item in enumerate(items)
+                    ),
+                    key=lambda item: item.identity,
+                )
+            )
+        else:
+            errors.append("podList.items must be a list")
+
+    completeness_issues = [f"{issue.operation}: {issue.message}" for issue in issues]
+    if status != "complete":
+        completeness_issues.append("Pod collection status is incomplete")
+    if request is None:
+        completeness_issues.append("Pod list-request provenance is missing")
+    else:
+        if request.namespace != scope.namespace:
+            completeness_issues.append(
+                "Pod list-request namespace does not match the Service"
+            )
+        if request.label_selector != "":
+            completeness_issues.append(
+                "Pod list request is not an unfiltered namespace snapshot"
+            )
+    if pods is None:
+        completeness_issues.append("Pod list evidence is missing")
+    else:
+        if not resource_version:
+            completeness_issues.append("Pod list has no resourceVersion snapshot")
+        if continue_token:
+            completeness_issues.append(
+                "Pod list pagination is incomplete (continue token present)"
+            )
+        identities = [pod.identity for pod in pods]
+        if len(identities) != len(set(identities)):
+            completeness_issues.append("Pod identities are duplicated")
+        uids = [pod.uid for pod in pods]
+        if len(uids) != len(set(uids)):
+            completeness_issues.append("Pod UIDs are duplicated")
+        if any(pod.namespace != scope.namespace for pod in pods):
+            completeness_issues.append(
+                "Pod list contains Pods outside the requested namespace"
+            )
+
+    return PodEvidence(
+        collection_status=status,
+        collection_issues=issues,
+        request=request,
+        pods=pods,
+        resource_version=resource_version,
+        continue_token=continue_token,
+        completeness_issues=tuple(completeness_issues),
+    )
 
 
 def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
@@ -491,6 +691,8 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
         else:
             errors.append("endpointSliceList.items must be a list")
 
+    pod_evidence = _normalize_pod_evidence(raw, collection, scope, errors)
+
     if errors:
         raise EvidenceValidationError(errors)
 
@@ -556,6 +758,7 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
         endpoint_slice_resource_version=resource_version,
         endpoint_slice_continue=continue_token,
         completeness_issues=tuple(completeness_issues),
+        pod_evidence=pod_evidence,
     )
 
 
@@ -587,12 +790,161 @@ def _selectorless_causes(
     return (f"All {unready_count} manually managed endpoints are explicitly unready.",)
 
 
+def _pod_matches_selector(pod: Pod, service: Service) -> bool:
+    labels = dict(pod.labels)
+    return all(labels.get(key) == value for key, value in service.selector or ())
+
+
+def _pod_cause_analysis(
+    evidence: EvidenceBundle, service: Service
+) -> tuple[
+    tuple[ObservedEvidence, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    pod_evidence = evidence.pod_evidence
+    default_causes = (
+        "No matching Pods may exist.",
+        "The Service selector may not match the intended Pods.",
+        "Matching Pods may be failing readiness checks.",
+        "EndpointSlice controller data may not have converged.",
+    )
+    if pod_evidence is None:
+        return (
+            (),
+            (),
+            default_causes,
+            (),
+            ("The observed condition does not independently confirm its cause.",),
+        )
+    if pod_evidence.completeness_issues:
+        return (
+            (),
+            (),
+            default_causes,
+            (),
+            (
+                "Pod cause evidence is incomplete, so no endpoint cause is confirmed.",
+                *pod_evidence.completeness_issues,
+            ),
+        )
+
+    pods = pod_evidence.pods or ()
+    matching = tuple(pod for pod in pods if _pod_matches_selector(pod, service))
+    ready_count = sum(pod.ready is True for pod in matching)
+    unready_count = sum(pod.ready is False for pod in matching)
+    unknown_count = sum(pod.ready is None for pod in matching)
+    observation = ObservedEvidence(
+        statement=(
+            f"Complete namespace Pod snapshot contains {len(pods)} Pods; "
+            f"{len(matching)} match the Service selector: {ready_count} ready, "
+            f"{unready_count} unready, {unknown_count} unknown readiness"
+        ),
+        source=evidence.source,
+        source_collected_at=evidence.source_collected_at,
+        collected_at=evidence.collected_at,
+        resource=(
+            f"PodList/{evidence.scope.namespace}@{pod_evidence.resource_version}"
+        ),
+        transformations=(
+            f"validated against {EVIDENCE_SCHEMA_VERSION}",
+            "matched projected Pod labels against the observed Service selector",
+        ),
+    )
+    snapshot_limitation = (
+        "Service, EndpointSlice, and Pod reads are not an atomic cross-resource "
+        "snapshot."
+    )
+
+    if not pods:
+        return (
+            (observation,),
+            ("The complete namespace-scoped Pod snapshot contains no Pods.",),
+            ("No workload may currently be creating Pods in the namespace.",),
+            (),
+            (
+                "The observations do not establish why the namespace has no Pods.",
+                snapshot_limitation,
+            ),
+        )
+    if not matching:
+        return (
+            (observation,),
+            (
+                f"The Service selector matches none of the {len(pods)} Pods in the "
+                "complete namespace-scoped snapshot.",
+            ),
+            ("The Service selector may not match the intended Pods.",),
+            (),
+            (
+                "The evidence does not establish which Pods, if any, were intended "
+                "for the Service.",
+                snapshot_limitation,
+            ),
+        )
+    if ready_count:
+        return (
+            (observation,),
+            (
+                "At least one Pod matching the Service selector explicitly reports "
+                "Ready=True.",
+            ),
+            ("EndpointSlice controller data may not have converged.",),
+            (),
+            (
+                "Pod readiness and EndpointSlice readiness are inconsistent, so no "
+                "endpoint cause is confirmed.",
+                snapshot_limitation,
+            ),
+        )
+    if unknown_count:
+        return (
+            (observation,),
+            (),
+            (
+                "Matching Pods may be unready, but one or more Pod Ready conditions "
+                "are unknown.",
+            ),
+            (),
+            (
+                "Pod readiness is missing or unknown, so an unready-Pod cause cannot "
+                "be established.",
+                snapshot_limitation,
+            ),
+        )
+    return (
+        (observation,),
+        (
+            f"All {len(matching)} Pods matching the Service selector explicitly "
+            "report Ready=False.",
+        ),
+        ("Matching Pods may be failing readiness checks.",),
+        (
+            f"All {len(matching)} Pods matching the Service selector explicitly "
+            "reported Ready=False during the bounded collection.",
+        ),
+        (
+            "The evidence establishes the immediate readiness condition, not why the "
+            "Pods are unready.",
+            snapshot_limitation,
+        ),
+    )
+
+
 def evaluate_service_no_ready_endpoints(
     evidence: EvidenceBundle,
 ) -> DiagnosticReport:
     """Evaluate SERVICE_NO_READY_ENDPOINTS from normalized evidence."""
 
     service = evidence.service
+    pod_issues = (
+        evidence.pod_evidence.collection_issues
+        if evidence.pod_evidence is not None
+        else ()
+    )
+    collection_issues = (*evidence.collection_issues, *pod_issues)
     if service is None:
         identity = f"{evidence.scope.namespace}/{evidence.scope.service_name}"
         return DiagnosticReport(
@@ -601,7 +953,7 @@ def evaluate_service_no_ready_endpoints(
             summary=f"{RULE_ID}: inconclusive for requested Service {identity}",
             target=evidence.scope,
             service=None,
-            collection_issues=evidence.collection_issues,
+            collection_issues=collection_issues,
             observed_evidence=(),
             derived_findings=(),
             possible_causes=(),
@@ -630,7 +982,7 @@ def evaluate_service_no_ready_endpoints(
             summary=f"{RULE_ID}: not applicable to ExternalName {service.identity}",
             target=evidence.scope,
             service=service,
-            collection_issues=evidence.collection_issues,
+            collection_issues=collection_issues,
             observed_evidence=(service_observation,),
             derived_findings=(
                 "ExternalName Services do not use EndpointSlices for this rule.",
@@ -647,7 +999,7 @@ def evaluate_service_no_ready_endpoints(
             summary=f"{RULE_ID}: inconclusive for Service {service.identity}",
             target=evidence.scope,
             service=service,
-            collection_issues=evidence.collection_issues,
+            collection_issues=collection_issues,
             observed_evidence=(service_observation,),
             derived_findings=(),
             possible_causes=(),
@@ -696,7 +1048,7 @@ def evaluate_service_no_ready_endpoints(
             summary=f"{RULE_ID}: inconclusive for Service {service.identity}",
             target=evidence.scope,
             service=service,
-            collection_issues=evidence.collection_issues,
+            collection_issues=collection_issues,
             observed_evidence=observations,
             derived_findings=(),
             possible_causes=(),
@@ -714,7 +1066,7 @@ def evaluate_service_no_ready_endpoints(
             summary=f"{RULE_ID}: no finding for Service {service.identity}",
             target=evidence.scope,
             service=service,
-            collection_issues=evidence.collection_issues,
+            collection_issues=collection_issues,
             observed_evidence=observations,
             derived_findings=("At least one logical endpoint is explicitly ready.",),
             possible_causes=(),
@@ -733,7 +1085,7 @@ def evaluate_service_no_ready_endpoints(
             summary=f"{RULE_ID}: inconclusive for Service {service.identity}",
             target=evidence.scope,
             service=service,
-            collection_issues=evidence.collection_issues,
+            collection_issues=collection_issues,
             observed_evidence=observations,
             derived_findings=(),
             possible_causes=(),
@@ -748,30 +1100,36 @@ def evaluate_service_no_ready_endpoints(
         possible_causes = _selectorless_causes(
             len(endpoint_slices), len(readiness_by_identity), unready_count
         )
-    else:
-        possible_causes = (
-            "No matching Pods may exist.",
-            "The Service selector may not match the intended Pods.",
-            "Matching Pods may be failing readiness checks.",
-            "EndpointSlice controller data may not have converged.",
+        pod_observations: tuple[ObservedEvidence, ...] = ()
+        pod_findings: tuple[str, ...] = ()
+        confirmed_causes: tuple[str, ...] = ()
+        limitations = (
+            "The observed condition does not independently confirm its cause.",
         )
+    else:
+        (
+            pod_observations,
+            pod_findings,
+            possible_causes,
+            confirmed_causes,
+            limitations,
+        ) = _pod_cause_analysis(evidence, service)
     return DiagnosticReport(
         rule_id=RULE_ID,
         outcome=Outcome.FINDING,
         summary=f"{RULE_ID}: Service {service.identity} has no ready endpoints",
         target=evidence.scope,
         service=service,
-        collection_issues=evidence.collection_issues,
-        observed_evidence=observations,
+        collection_issues=collection_issues,
+        observed_evidence=(*observations, *pod_observations),
         derived_findings=(
             "The complete associated EndpointSlice snapshot contains zero "
             "explicitly ready logical endpoints.",
+            *pod_findings,
         ),
         possible_causes=possible_causes,
-        confirmed_causes=(),
-        limitations=(
-            "The observed condition does not independently confirm its cause.",
-        ),
+        confirmed_causes=confirmed_causes,
+        limitations=limitations,
     )
 
 

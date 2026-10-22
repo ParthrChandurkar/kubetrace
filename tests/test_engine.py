@@ -11,6 +11,7 @@ from kubetrace.engine import (
     MAX_ENDPOINT_SLICES,
     MAX_ENDPOINTS,
     MAX_FIXTURE_BYTES,
+    MAX_PODS,
     MAX_VALIDATION_ERRORS,
     EvidenceValidationError,
     FixtureCollector,
@@ -94,6 +95,60 @@ def endpoint_slice(
     }
 
 
+def pod(
+    name: str,
+    labels: dict[str, str],
+    ready: bool | None,
+    *,
+    namespace: str = "shop",
+    uid: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": namespace,
+            "name": name,
+            "uid": uid or f"pod-{name}",
+            "labels": labels,
+        },
+        "status": {"ready": ready},
+    }
+
+
+def add_pod_evidence(
+    evidence: dict[str, Any],
+    pods: list[dict[str, Any]] | None,
+    *,
+    status: str = "complete",
+    namespace: str = "shop",
+    label_selector: str = "",
+    continuation: str = "",
+    resource_version: str = "200",
+    issues: list[dict[str, Any]] | None = None,
+) -> None:
+    collection: dict[str, Any] = {
+        "status": status,
+        "request": {
+            "namespace": namespace,
+            "labelSelector": label_selector,
+        },
+    }
+    if issues is not None:
+        collection["issues"] = issues
+    evidence["collection"]["podListCollection"] = collection
+    if pods is not None:
+        evidence["podList"] = {
+            "apiVersion": "v1",
+            "kind": "PodList",
+            "metadata": {
+                "resourceVersion": resource_version,
+                "continue": continuation,
+            },
+            "items": pods,
+        }
+
+
 def diagnose(evidence: dict[str, Any]) -> DiagnosticReport:
     return run_diagnostic(StaticCollector(evidence))
 
@@ -109,6 +164,209 @@ def test_empty_endpoint_slice_list_with_valid_provenance_is_finding() -> None:
         "The complete associated EndpointSlice snapshot contains zero "
         "explicitly ready logical endpoints.",
     )
+
+
+def test_complete_pod_snapshot_derives_selector_matches_no_observed_pods() -> None:
+    evidence = fixture_evidence(ready_values=[])
+    evidence["endpointSliceList"]["items"] = []
+    add_pod_evidence(
+        evidence,
+        [pod("catalog-a", {"app": "catalog"}, True)],
+    )
+
+    report = diagnose(evidence)
+
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == ()
+    assert report.derived_findings[-1] == (
+        "The Service selector matches none of the 1 Pods in the complete "
+        "namespace-scoped snapshot."
+    )
+    assert report.possible_causes == (
+        "The Service selector may not match the intended Pods.",
+    )
+    assert "does not establish which Pods" in report.limitations[0]
+
+
+def test_complete_empty_pod_snapshot_distinguishes_no_pods_observed() -> None:
+    evidence = fixture_evidence(ready_values=[])
+    evidence["endpointSliceList"]["items"] = []
+    add_pod_evidence(evidence, [])
+
+    report = diagnose(evidence)
+
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == ()
+    assert report.derived_findings[-1] == (
+        "The complete namespace-scoped Pod snapshot contains no Pods."
+    )
+
+
+def test_complete_pod_snapshot_confirms_all_matching_pods_are_unready() -> None:
+    evidence = fixture_evidence(ready_values=[False])
+    add_pod_evidence(
+        evidence,
+        [
+            pod("checkout-a", {"app": "checkout"}, False),
+            pod("checkout-b", {"app": "checkout"}, False),
+        ],
+    )
+
+    report = diagnose(evidence)
+
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == (
+        "All 2 Pods matching the Service selector explicitly reported Ready=False "
+        "during the bounded collection.",
+    )
+    assert report.possible_causes == ("Matching Pods may be failing readiness checks.",)
+
+
+def test_service_selector_requires_every_label_and_allows_extra_pod_labels() -> None:
+    evidence = fixture_evidence(ready_values=[False])
+    evidence["service"]["spec"]["selector"] = {
+        "app": "checkout",
+        "tier": "frontend",
+    }
+    add_pod_evidence(
+        evidence,
+        [
+            pod(
+                "checkout-a",
+                {"app": "checkout", "tier": "frontend", "version": "v1"},
+                False,
+            ),
+            pod("checkout-b", {"app": "checkout", "tier": "backend"}, False),
+        ],
+    )
+
+    report = diagnose(evidence)
+
+    assert report.confirmed_causes == (
+        "All 1 Pods matching the Service selector explicitly reported Ready=False "
+        "during the bounded collection.",
+    )
+    assert "1 match the Service selector" in report.observed_evidence[-1].statement
+
+
+def test_partial_selector_match_is_not_a_matching_pod_or_confirmed_cause() -> None:
+    evidence = fixture_evidence(ready_values=[False])
+    evidence["service"]["spec"]["selector"] = {
+        "app": "checkout",
+        "tier": "frontend",
+    }
+    add_pod_evidence(
+        evidence,
+        [pod("checkout-a", {"app": "checkout", "tier": "backend"}, False)],
+    )
+
+    report = diagnose(evidence)
+
+    assert report.confirmed_causes == ()
+    assert "selector matches none" in report.derived_findings[-1]
+
+
+@pytest.mark.parametrize("ready", [True, None])
+def test_ready_or_unknown_matching_pod_cannot_confirm_cause(
+    ready: bool | None,
+) -> None:
+    evidence = fixture_evidence(ready_values=[False])
+    add_pod_evidence(evidence, [pod("checkout-a", {"app": "checkout"}, ready)])
+
+    report = diagnose(evidence)
+
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == ()
+    if ready is True:
+        assert "inconsistent" in report.limitations[0]
+    else:
+        assert "missing or unknown" in report.limitations[0]
+
+
+def test_incomplete_pod_collection_does_not_confirm_a_cause() -> None:
+    evidence = fixture_evidence(ready_values=[])
+    evidence["endpointSliceList"]["items"] = []
+    add_pod_evidence(
+        evidence,
+        None,
+        status="incomplete",
+        issues=[
+            {
+                "operation": "list_pods",
+                "code": "forbidden",
+                "message": "Kubernetes API authorization was denied.",
+                "status": 403,
+            }
+        ],
+    )
+
+    report = diagnose(evidence)
+
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == ()
+    assert report.collection_issues[0].code == "forbidden"
+    assert report.limitations[0] == (
+        "Pod cause evidence is incomplete, so no endpoint cause is confirmed."
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("request-missing", "Pod list-request provenance is missing"),
+        ("request-namespace", "Pod list-request namespace does not match"),
+        ("request-selector", "not an unfiltered namespace snapshot"),
+        ("continuation", "Pod list pagination is incomplete"),
+        ("pod-namespace", "outside the requested namespace"),
+        ("duplicate-name", "Pod identities are duplicated"),
+        ("duplicate-uid", "Pod UIDs are duplicated"),
+    ],
+)
+def test_inconsistent_pod_evidence_cannot_confirm_cause(
+    mutation: str, expected: str
+) -> None:
+    evidence = fixture_evidence(ready_values=[])
+    pods = [pod("catalog-a", {"app": "catalog"}, True)]
+    add_pod_evidence(evidence, pods)
+    if mutation == "request-missing":
+        evidence["collection"]["podListCollection"].pop("request")
+    elif mutation == "request-namespace":
+        evidence["collection"]["podListCollection"]["request"]["namespace"] = "other"
+    elif mutation == "request-selector":
+        evidence["collection"]["podListCollection"]["request"]["labelSelector"] = (
+            "app=checkout"
+        )
+    elif mutation == "continuation":
+        evidence["podList"]["metadata"]["continue"] = "next"
+    elif mutation == "pod-namespace":
+        pods[0]["metadata"]["namespace"] = "other"
+    elif mutation == "duplicate-name":
+        pods.append(deepcopy(pods[0]))
+        pods[1]["metadata"]["uid"] = "other-uid"
+    else:
+        pods.append(pod("catalog-b", {"app": "catalog"}, True, uid="pod-catalog-a"))
+
+    report = diagnose(evidence)
+
+    assert report.outcome is Outcome.FINDING
+    assert report.confirmed_causes == ()
+    assert any(expected in limitation for limitation in report.limitations)
+
+
+def test_duplicate_pod_identity_with_conflicting_readiness_cannot_confirm_cause() -> (
+    None
+):
+    evidence = fixture_evidence(ready_values=[False])
+    pods = [
+        pod("checkout-a", {"app": "checkout"}, False),
+        pod("checkout-a", {"app": "checkout"}, True),
+    ]
+    add_pod_evidence(evidence, pods)
+
+    report = diagnose(evidence)
+
+    assert report.confirmed_causes == ()
+    assert any("Pod identities are duplicated" in item for item in report.limitations)
 
 
 @pytest.mark.parametrize(
@@ -399,6 +657,15 @@ def test_endpoint_count_limit() -> None:
         normalize(evidence)
 
 
+def test_pod_count_limit() -> None:
+    evidence = fixture_evidence(ready_values=[])
+    item = pod("checkout-a", {"app": "checkout"}, False)
+    add_pod_evidence(evidence, [item] * (MAX_PODS + 1))
+
+    with pytest.raises(EvidenceValidationError, match="Pod limit"):
+        normalize(evidence)
+
+
 def test_validation_error_limit() -> None:
     evidence = fixture_evidence(ready_values=[])
     evidence["endpointSliceList"]["items"][0]["endpoints"] = [
@@ -480,16 +747,60 @@ def test_invalid_readiness_type_is_validation_error() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("ready", "False", "status.ready"),
+        ("labels", {"app": 7}, "metadata.labels.app"),
+    ],
+)
+def test_malformed_pod_fields_are_validation_errors(
+    field: str, value: Any, expected: str
+) -> None:
+    evidence = fixture_evidence(ready_values=[False])
+    item = pod("checkout-a", {"app": "checkout"}, False)
+    add_pod_evidence(evidence, [item])
+    if field == "ready":
+        item["status"]["ready"] = value
+    else:
+        item["metadata"]["labels"] = value
+
+    with pytest.raises(EvidenceValidationError, match=expected):
+        normalize(evidence)
+
+
+@pytest.mark.parametrize(
     ("filename", "outcome"),
     [
         ("service-no-ready-endpoints.json", Outcome.FINDING),
         ("service-with-ready-endpoint.json", Outcome.NO_FINDING),
+        ("service-selector-matches-no-pods.json", Outcome.FINDING),
+        ("service-matching-pods-not-ready.json", Outcome.FINDING),
     ],
 )
 def test_checked_in_fixtures_use_normal_pipeline(
     filename: str, outcome: Outcome
 ) -> None:
     assert run_diagnostic(FixtureCollector(FIXTURES / filename)).outcome is outcome
+
+
+def test_no_matching_pods_fixture_does_not_confirm_root_cause() -> None:
+    report = run_diagnostic(
+        FixtureCollector(FIXTURES / "service-selector-matches-no-pods.json")
+    )
+
+    assert report.confirmed_causes == ()
+    assert "selector matches none" in report.derived_findings[-1]
+    assert report.observed_evidence[-1].resource.startswith("PodList/shop@")
+
+
+def test_unready_pods_fixture_emits_evidence_backed_confirmed_condition() -> None:
+    report = run_diagnostic(
+        FixtureCollector(FIXTURES / "service-matching-pods-not-ready.json")
+    )
+
+    assert len(report.confirmed_causes) == 1
+    assert "explicitly reported Ready=False" in report.confirmed_causes[0]
+    assert report.observed_evidence[-1].resource.startswith("PodList/shop@")
 
 
 def test_reordered_slices_and_endpoints_have_deterministic_output() -> None:
@@ -508,6 +819,23 @@ def test_reordered_slices_and_endpoints_have_deterministic_output() -> None:
     second_output = to_json(report_payload(diagnose(reordered)))
 
     assert first == second_output
+
+
+def test_reordered_pods_have_deterministic_output() -> None:
+    evidence = fixture_evidence(ready_values=[False])
+    add_pod_evidence(
+        evidence,
+        [
+            pod("checkout-b", {"app": "checkout"}, False),
+            pod("checkout-a", {"app": "checkout"}, False),
+        ],
+    )
+    reordered = deepcopy(evidence)
+    reordered["podList"]["items"].reverse()
+
+    assert to_json(report_payload(diagnose(evidence))) == to_json(
+        report_payload(diagnose(reordered))
+    )
 
 
 def test_normal_report_has_exact_shape_and_cause_text() -> None:
