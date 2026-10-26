@@ -336,4 +336,6 @@ def main(
 
     print(to_json(report_payload(report)), end="")
     print(_terminal_safe(report.summary), file=sys.stderr)
+    for step in report.investigation_guidance[:3]:
+        print(_terminal_safe(f"NEXT: {step}"), file=sys.stderr)
     return 0

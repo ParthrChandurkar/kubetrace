@@ -11,6 +11,7 @@ from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from pathlib import Path
 from typing import Any, Protocol
 
+from kubetrace.explainability import explain_report
 from kubetrace.models import (
     EVIDENCE_SCHEMA_VERSION,
     RULE_ID,
@@ -2579,7 +2580,7 @@ def evaluate_service_no_ready_endpoints(evidence: EvidenceBundle) -> DiagnosticR
     summary = report.summary
     if any("matching dropped flows" in finding for finding in findings):
         summary = f"{summary}; correlated Hubble drops were observed"
-    return replace(
+    enriched = replace(
         report,
         summary=summary,
         collection_issues=(*report.collection_issues, *issues),
@@ -2601,6 +2602,7 @@ def evaluate_service_no_ready_endpoints(evidence: EvidenceBundle) -> DiagnosticR
             *limitations,
         ),
     )
+    return explain_report(enriched, evidence)
 
 
 def run_diagnostic(collector: EvidenceCollector) -> DiagnosticReport:

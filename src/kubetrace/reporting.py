@@ -11,6 +11,7 @@ from kubetrace.models import REPORT_SCHEMA_VERSION, RULE_ID, DiagnosticReport, O
 def report_payload(report: DiagnosticReport) -> dict[str, Any]:
     """Convert a diagnostic report to its versioned public representation."""
 
+    explanation = report.explanation
     return {
         "schemaVersion": REPORT_SCHEMA_VERSION,
         "ruleId": report.rule_id,
@@ -53,6 +54,26 @@ def report_payload(report: DiagnosticReport) -> dict[str, Any]:
         "possibleCauses": list(report.possible_causes),
         "confirmedCauses": list(report.confirmed_causes),
         "limitations": list(report.limitations),
+        "explanation": (
+            {
+                "supportingEvidence": [
+                    {
+                        "source": item.source,
+                        "sourceCollectedAt": item.source_collected_at,
+                        "resource": item.resource,
+                        "statement": item.statement,
+                    }
+                    for item in report.observed_evidence
+                ],
+                "reasoning": list(explanation.reasoning),
+                "establishes": list(explanation.establishes),
+                "doesNotEstablish": list(explanation.does_not_establish),
+                "missingEvidence": list(explanation.missing_evidence),
+            }
+            if explanation is not None
+            else None
+        ),
+        "investigationGuidance": list(report.investigation_guidance),
         "errors": [],
     }
 
@@ -74,6 +95,20 @@ def validation_error_payload(errors: tuple[str, ...]) -> dict[str, Any]:
         "possibleCauses": [],
         "confirmedCauses": [],
         "limitations": [],
+        "explanation": {
+            "supportingEvidence": [],
+            "reasoning": [],
+            "establishes": [],
+            "doesNotEstablish": [
+                "Invalid input cannot support a diagnostic conclusion."
+            ],
+            "missingEvidence": [
+                "Valid evidence is required before diagnostic rules can run."
+            ],
+        },
+        "investigationGuidance": [
+            "Correct the reported validation errors and rerun the investigation."
+        ],
     }
 
 

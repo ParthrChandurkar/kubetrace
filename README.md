@@ -267,6 +267,50 @@ read cannot be presented as observed evidence. Bounded, sanitized
 normalization make equivalent reports deterministic, apart from collection
 timestamps obtained at runtime.
 
+Every report also includes an `explanation` and `investigationGuidance`. The
+explanation identifies concise supporting-evidence references, the deterministic
+reasoning steps, what the result establishes, what it does not establish, and
+missing or incomplete evidence. Guidance is selected from the actual outcome
+and collected sources; it does not prescribe actions for evidence that was not
+observed. The terminal view prints the summary followed by at most three
+`NEXT:` steps, while JSON retains the complete explanation and guidance.
+
+For example, a no-ready-endpoints report with matching unready Pods can include:
+
+```json
+{
+  "schemaVersion": "kubetrace.report/v2",
+  "outcome": "finding",
+  "explanation": {
+    "supportingEvidence": [
+      {
+        "source": "fixture",
+        "sourceCollectedAt": "2026-10-22T12:00:00Z",
+        "resource": "PodList/shop@201",
+        "statement": "Complete namespace Pod snapshot contains 1 Pods; 1 match the Service selector: 0 ready, 1 unready, 0 unknown readiness"
+      }
+    ],
+    "reasoning": [
+      "All 1 Pods matching the Service selector explicitly reported Ready=False during the bounded collection."
+    ],
+    "establishes": [
+      "All 1 Pods matching the Service selector explicitly reported Ready=False during the bounded collection."
+    ],
+    "doesNotEstablish": [
+      "The evidence establishes the immediate readiness condition, not why the Pods are unready."
+    ],
+    "missingEvidence": []
+  },
+  "investigationGuidance": [
+    "Inspect the matching Pods' Ready conditions, readiness probes, events, and container status to determine why readiness is failing."
+  ]
+}
+```
+
+These are additive fields in `kubetrace.report/v2`; the existing outcome,
+observations, findings, cause, limitation, and error fields retain their
+meanings. Consumers should ignore unknown fields for forward compatibility.
+
 ## Resource limits
 
 Fixture input is limited to 1,048,576 bytes, 256 EndpointSlices, 10,000 endpoint

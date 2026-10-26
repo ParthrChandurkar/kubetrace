@@ -854,6 +854,8 @@ def test_normal_report_has_exact_shape_and_cause_text() -> None:
         "possibleCauses",
         "confirmedCauses",
         "limitations",
+        "explanation",
+        "investigationGuidance",
         "errors",
     }
     assert payload["possibleCauses"] == [
@@ -896,6 +898,8 @@ def test_validation_error_report_has_exact_shape() -> None:
         "possibleCauses",
         "confirmedCauses",
         "limitations",
+        "explanation",
+        "investigationGuidance",
     }
     assert payload["service"] is None
     assert payload["target"] is None

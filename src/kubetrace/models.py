@@ -259,6 +259,14 @@ class ObservedEvidence:
 
 
 @dataclass(frozen=True)
+class DiagnosticExplanation:
+    reasoning: tuple[str, ...]
+    establishes: tuple[str, ...]
+    does_not_establish: tuple[str, ...]
+    missing_evidence: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class DiagnosticReport:
     rule_id: str
     outcome: Outcome
@@ -271,3 +279,5 @@ class DiagnosticReport:
     possible_causes: tuple[str, ...]
     confirmed_causes: tuple[str, ...]
     limitations: tuple[str, ...]
+    explanation: DiagnosticExplanation | None = None
+    investigation_guidance: tuple[str, ...] = ()

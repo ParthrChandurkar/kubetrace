@@ -61,6 +61,18 @@ def test_cli_checked_in_fixture_outcomes(filename: str, outcome: str, capsys) ->
     assert "SERVICE_NO_READY_ENDPOINTS" in captured.err
 
 
+def test_cli_prints_bounded_guidance_and_keeps_full_json(capsys) -> None:
+    exit_status = main([str(FIXTURES / "service-matching-pods-not-ready.json")])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exit_status == 0
+    assert payload["explanation"]["supportingEvidence"]
+    assert payload["investigationGuidance"]
+    assert 1 <= captured.err.count("NEXT: ") <= 3
+    assert all(step in captured.err for step in payload["investigationGuidance"][:3])
+
+
 def test_cli_inconclusive_exit_status(tmp_path: Path, capsys) -> None:
     evidence = load_fixture()
     evidence["collection"]["status"] = "incomplete"
