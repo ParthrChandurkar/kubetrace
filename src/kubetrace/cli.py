@@ -7,6 +7,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from typing import Any
 
 from kubetrace.engine import (
@@ -104,6 +105,19 @@ def _parser() -> argparse.ArgumentParser:
         "--kubeconfig",
         help="kubeconfig path (the Kubernetes client default is used when omitted)",
     )
+    kubernetes.add_argument(
+        "--direction", choices=("ingress", "egress"), help="traffic direction"
+    )
+    kubernetes.add_argument("--protocol", choices=("TCP", "UDP", "SCTP"), default="TCP")
+    kubernetes.add_argument("--port", type=int, help="numeric traffic port")
+    kubernetes.add_argument("--peer-namespace", help="peer namespace name")
+    kubernetes.add_argument("--peer-ip", help="peer IP address")
+    kubernetes.add_argument(
+        "--peer-namespace-label", action="append", default=[], metavar="KEY=VALUE"
+    )
+    kubernetes.add_argument(
+        "--peer-pod-label", action="append", default=[], metavar="KEY=VALUE"
+    )
     return parser
 
 
@@ -127,6 +141,7 @@ def _create_kubernetes_session(
     service_name: str,
     kubeconfig: str | None,
     context: str | None,
+    traffic: Mapping[str, Any] | None = None,
 ) -> _KubernetesSession:
     try:
         from kubernetes import client, config
@@ -149,9 +164,11 @@ def _create_kubernetes_session(
         collector = KubernetesCollector(
             core_api=client.CoreV1Api(api_client),
             discovery_api=client.DiscoveryV1Api(api_client),
+            networking_api=client.NetworkingV1Api(api_client),
             namespace=namespace,
             service_name=service_name,
             clock=lambda: datetime.now(UTC),
+            traffic=traffic,
         )
     except Exception as error:
         if api_client is not None:
@@ -170,16 +187,78 @@ def _create_kubernetes_session(
     )
 
 
+def _parse_cli_labels(values: Sequence[str], option: str) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for value in values:
+        key, separator, item = value.partition("=")
+        if not separator or not key or not key.isprintable() or not item.isprintable():
+            raise EvidenceValidationError([f"{option} must use printable KEY=VALUE"])
+        if key in labels and labels[key] != item:
+            raise EvidenceValidationError([f"{option} repeats {key} inconsistently"])
+        labels[key] = item
+    return labels
+
+
+def _traffic_from_arguments(arguments: argparse.Namespace) -> Mapping[str, Any] | None:
+    namespace_labels = _parse_cli_labels(
+        arguments.peer_namespace_label, "--peer-namespace-label"
+    )
+    pod_labels = _parse_cli_labels(arguments.peer_pod_label, "--peer-pod-label")
+    requested = any(
+        (
+            arguments.direction,
+            arguments.port,
+            arguments.peer_namespace,
+            arguments.peer_ip,
+            namespace_labels,
+            pod_labels,
+        )
+    )
+    if not requested:
+        return None
+    if arguments.direction is None or arguments.port is None:
+        raise EvidenceValidationError(
+            ["traffic evaluation requires both --direction and --port"]
+        )
+    if not 1 <= arguments.port <= 65535:
+        raise EvidenceValidationError(["--port must be between 1 and 65535"])
+    peer: dict[str, Any] = {}
+    if arguments.peer_namespace is not None:
+        peer["namespace"] = arguments.peer_namespace
+    if arguments.peer_ip is not None:
+        try:
+            peer["ip"] = str(ip_address(arguments.peer_ip))
+        except ValueError as error:
+            raise EvidenceValidationError(
+                ["--peer-ip must be a valid IP address"]
+            ) from error
+    if namespace_labels:
+        peer["namespaceLabels"] = namespace_labels
+    if pod_labels:
+        peer["podLabels"] = pod_labels
+    return {
+        "direction": arguments.direction,
+        "protocol": arguments.protocol,
+        "port": arguments.port,
+        "peer": peer,
+    }
+
+
 def _run_kubernetes(
     arguments: argparse.Namespace,
-    session_factory: Callable[[str, str, str | None, str | None], _KubernetesSession],
+    session_factory: Callable[
+        [str, str, str | None, str | None, Mapping[str, Any] | None],
+        _KubernetesSession,
+    ],
 ) -> DiagnosticReport:
+    traffic = _traffic_from_arguments(arguments)
     try:
         session = session_factory(
             arguments.namespace,
             arguments.service,
             arguments.kubeconfig,
             arguments.context,
+            traffic,
         )
     except _KubernetesSetupError as error:
         return run_diagnostic(
@@ -201,7 +280,8 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     kubernetes_session_factory: Callable[
-        [str, str, str | None, str | None], _KubernetesSession
+        [str, str, str | None, str | None, Mapping[str, Any] | None],
+        _KubernetesSession,
     ] = _create_kubernetes_session,
 ) -> int:
     """Run one investigation and write its versioned report."""

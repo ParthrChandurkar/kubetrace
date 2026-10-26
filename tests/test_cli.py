@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -44,6 +45,7 @@ def write_fixture(tmp_path: Path, evidence: dict[str, Any]) -> Path:
         ("service-with-ready-endpoint.json", "no_finding"),
         ("service-selector-matches-no-pods.json", "finding"),
         ("service-matching-pods-not-ready.json", "finding"),
+        ("service-networkpolicy-ingress-default-deny.json", "finding"),
     ],
 )
 def test_cli_checked_in_fixture_outcomes(filename: str, outcome: str, capsys) -> None:
@@ -158,7 +160,7 @@ def test_fixture_mode_never_initializes_kubernetes(capsys) -> None:
 def test_kubernetes_mode_uses_target_and_shared_pipeline(capsys) -> None:
     evidence = load_fixture()
     evidence["collection"]["source"] = "kubernetes-api"
-    calls: list[tuple[str, str, str | None, str | None]] = []
+    calls: list[tuple[str, str, str | None, str | None, Mapping[str, Any] | None]] = []
     closed: list[bool] = []
 
     def session_factory(
@@ -166,8 +168,9 @@ def test_kubernetes_mode_uses_target_and_shared_pipeline(capsys) -> None:
         service_name: str,
         kubeconfig: str | None,
         context: str | None,
+        traffic: Mapping[str, Any] | None,
     ) -> _KubernetesSession:
-        calls.append((namespace, service_name, kubeconfig, context))
+        calls.append((namespace, service_name, kubeconfig, context, traffic))
         return _KubernetesSession(
             collector=StaticCollector(evidence),
             close=lambda: closed.append(True),
@@ -190,7 +193,7 @@ def test_kubernetes_mode_uses_target_and_shared_pipeline(capsys) -> None:
 
     payload = json.loads(capsys.readouterr().out)
     assert exit_status == 0
-    assert calls == [("shop", "checkout", "test-config", "test-context")]
+    assert calls == [("shop", "checkout", "test-config", "test-context", None)]
     assert closed == [True]
     assert payload["outcome"] == "finding"
     assert payload["target"] == {"namespace": "shop", "serviceName": "checkout"}
@@ -203,6 +206,7 @@ def test_kubernetes_setup_failure_is_sanitized_and_inconclusive(capsys) -> None:
         _service_name: str,
         _kubeconfig: str | None,
         _context: str | None,
+        _traffic: Mapping[str, Any] | None,
     ) -> _KubernetesSession:
         raise _KubernetesSetupError(
             "configuration_error",
@@ -231,12 +235,92 @@ def test_kubernetes_setup_failure_is_sanitized_and_inconclusive(capsys) -> None:
     assert "secret-value" not in captured.err
 
 
+def test_kubernetes_cli_passes_bounded_traffic_context(capsys) -> None:
+    captured_traffic: list[Mapping[str, Any] | None] = []
+
+    def session_factory(
+        _namespace: str,
+        _service_name: str,
+        _kubeconfig: str | None,
+        _context: str | None,
+        traffic: Mapping[str, Any] | None,
+    ) -> _KubernetesSession:
+        captured_traffic.append(traffic)
+        return _KubernetesSession(
+            collector=StaticCollector(load_fixture()), close=lambda: None
+        )
+
+    status = main(
+        [
+            "kubernetes",
+            "--namespace",
+            "shop",
+            "--service",
+            "checkout",
+            "--direction",
+            "ingress",
+            "--protocol",
+            "TCP",
+            "--port",
+            "443",
+            "--peer-namespace",
+            "client",
+            "--peer-namespace-label",
+            "team=trusted",
+            "--peer-pod-label",
+            "app=caller",
+            "--peer-ip",
+            "192.0.2.10",
+        ],
+        kubernetes_session_factory=session_factory,
+    )
+
+    assert status == 0
+    assert captured_traffic == [
+        {
+            "direction": "ingress",
+            "protocol": "TCP",
+            "port": 443,
+            "peer": {
+                "namespace": "client",
+                "namespaceLabels": {"team": "trusted"},
+                "podLabels": {"app": "caller"},
+                "ip": "192.0.2.10",
+            },
+        }
+    ]
+    capsys.readouterr()
+
+
+def test_invalid_traffic_arguments_do_not_initialize_kubernetes(capsys) -> None:
+    def unexpected_factory(*_args: Any) -> _KubernetesSession:
+        pytest.fail("invalid traffic initialized Kubernetes")
+
+    status = main(
+        [
+            "kubernetes",
+            "--namespace",
+            "shop",
+            "--service",
+            "checkout",
+            "--direction",
+            "ingress",
+        ],
+        kubernetes_session_factory=unexpected_factory,
+    )
+
+    captured = capsys.readouterr()
+    assert status == 2
+    assert json.loads(captured.out)["outcome"] == "validation_error"
+
+
 def test_kubernetes_session_loads_config_without_persistence(monkeypatch) -> None:
     config_calls: list[dict[str, Any]] = []
     api_client = SimpleNamespace(closed=False)
     api_client.close = lambda: setattr(api_client, "closed", True)
     core_api = object()
     discovery_api = object()
+    networking_api = object()
 
     kubernetes = ModuleType("kubernetes")
     kubernetes.config = SimpleNamespace(
@@ -246,6 +330,7 @@ def test_kubernetes_session_loads_config_without_persistence(monkeypatch) -> Non
         ApiClient=lambda: api_client,
         CoreV1Api=lambda value: core_api if value is api_client else None,
         DiscoveryV1Api=lambda value: discovery_api if value is api_client else None,
+        NetworkingV1Api=lambda value: networking_api if value is api_client else None,
     )
     monkeypatch.setitem(sys.modules, "kubernetes", kubernetes)
 
@@ -262,6 +347,7 @@ def test_kubernetes_session_loads_config_without_persistence(monkeypatch) -> Non
     ]
     assert session.collector.core_api is core_api
     assert session.collector.discovery_api is discovery_api
+    assert session.collector.networking_api is networking_api
     assert session.collector.namespace == "shop"
     assert session.collector.service_name == "checkout"
     session.close()
@@ -275,6 +361,7 @@ def test_kubernetes_mode_runs_with_mocked_config_and_api_clients(
     service_calls: list[dict[str, Any]] = []
     pod_calls: list[dict[str, Any]] = []
     slice_calls: list[dict[str, Any]] = []
+    policy_calls: list[dict[str, Any]] = []
     api_client = SimpleNamespace(closed=False)
     api_client.close = lambda: setattr(api_client, "closed", True)
 
@@ -304,6 +391,12 @@ def test_kubernetes_mode_runs_with_mocked_config_and_api_clients(
         metadata=SimpleNamespace(resource_version="200", _continue=""),
         items=[],
     )
+    policy_page = SimpleNamespace(
+        api_version="networking.k8s.io/v1",
+        kind="NetworkPolicyList",
+        metadata=SimpleNamespace(resource_version="300", _continue=""),
+        items=[],
+    )
 
     class CoreApi:
         def read_namespaced_service(self, **kwargs: Any) -> Any:
@@ -319,6 +412,11 @@ def test_kubernetes_mode_runs_with_mocked_config_and_api_clients(
             slice_calls.append(kwargs)
             return endpoint_slice_page
 
+    class NetworkingApi:
+        def list_namespaced_network_policy(self, **kwargs: Any) -> Any:
+            policy_calls.append(kwargs)
+            return policy_page
+
     kubernetes = ModuleType("kubernetes")
     kubernetes.config = SimpleNamespace(
         load_kube_config=lambda **kwargs: config_calls.append(kwargs)
@@ -327,6 +425,7 @@ def test_kubernetes_mode_runs_with_mocked_config_and_api_clients(
         ApiClient=lambda: api_client,
         CoreV1Api=lambda value: CoreApi() if value is api_client else None,
         DiscoveryV1Api=lambda value: DiscoveryApi() if value is api_client else None,
+        NetworkingV1Api=lambda value: NetworkingApi() if value is api_client else None,
     )
     monkeypatch.setitem(sys.modules, "kubernetes", kubernetes)
 
@@ -361,6 +460,13 @@ def test_kubernetes_mode_runs_with_mocked_config_and_api_clients(
         {
             "namespace": "shop",
             "label_selector": "",
+            "limit": 100,
+            "_request_timeout": (3.0, 10.0),
+        }
+    ]
+    assert policy_calls == [
+        {
+            "namespace": "shop",
             "limit": 100,
             "_request_timeout": (3.0, 10.0),
         }

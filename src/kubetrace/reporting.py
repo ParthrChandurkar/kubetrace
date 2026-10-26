@@ -64,7 +64,7 @@ def validation_error_payload(errors: tuple[str, ...]) -> dict[str, Any]:
         "schemaVersion": REPORT_SCHEMA_VERSION,
         "ruleId": RULE_ID,
         "outcome": Outcome.VALIDATION_ERROR.value,
-        "summary": "Fixture evidence is invalid.",
+        "summary": "Evidence is invalid.",
         "target": None,
         "service": None,
         "collectionIssues": [],

@@ -261,7 +261,11 @@ def test_single_page_collection_uses_exact_read_only_arguments() -> None:
     }
     assert evidence["collection"]["podListCollection"] == {
         "status": "complete",
-        "request": {"namespace": "shop", "labelSelector": ""},
+        "request": {
+            "namespace": "shop",
+            "labelSelector": "",
+            "projectedLabelKeys": ["app"],
+        },
     }
     assert evidence["podList"]["metadata"] == {
         "resourceVersion": "200",

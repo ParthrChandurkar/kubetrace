@@ -106,6 +106,93 @@ class PodEvidence:
     resource_version: str | None
     continue_token: str | None
     completeness_issues: tuple[str, ...]
+    projected_label_keys: tuple[str, ...] | None
+
+
+@dataclass(frozen=True)
+class LabelSelectorRequirement:
+    key: str
+    operator: str
+    values: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LabelSelector:
+    match_labels: tuple[tuple[str, str], ...]
+    match_expressions: tuple[LabelSelectorRequirement, ...]
+
+
+@dataclass(frozen=True)
+class NetworkPolicyPort:
+    protocol: str
+    port: int | str | None
+    end_port: int | None
+
+
+@dataclass(frozen=True)
+class IPBlock:
+    cidr: str
+    exceptions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NetworkPolicyPeer:
+    pod_selector: LabelSelector | None
+    namespace_selector: LabelSelector | None
+    ip_block: IPBlock | None
+
+
+@dataclass(frozen=True)
+class NetworkPolicyRule:
+    peers: tuple[NetworkPolicyPeer, ...]
+    ports: tuple[NetworkPolicyPort, ...]
+
+
+@dataclass(frozen=True)
+class NetworkPolicy:
+    namespace: str
+    name: str
+    uid: str
+    pod_selector: LabelSelector
+    policy_types: tuple[str, ...]
+    ingress: tuple[NetworkPolicyRule, ...]
+    egress: tuple[NetworkPolicyRule, ...]
+
+    @property
+    def identity(self) -> str:
+        return f"{self.namespace}/{self.name}"
+
+
+@dataclass(frozen=True)
+class NetworkPolicyListRequest:
+    namespace: str | None
+
+
+@dataclass(frozen=True)
+class NetworkPolicyEvidence:
+    collection_status: str
+    collection_issues: tuple[CollectionIssue, ...]
+    request: NetworkPolicyListRequest | None
+    policies: tuple[NetworkPolicy, ...] | None
+    resource_version: str | None
+    continue_token: str | None
+    completeness_issues: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TrafficPeer:
+    namespace: str | None
+    namespace_labels: tuple[tuple[str, str], ...] | None
+    pod_labels: tuple[tuple[str, str], ...] | None
+    ip: str | None
+
+
+@dataclass(frozen=True)
+class TrafficContext:
+    direction: str
+    protocol: str
+    port: int
+    peer: TrafficPeer
 
 
 @dataclass(frozen=True)
@@ -123,6 +210,8 @@ class EvidenceBundle:
     endpoint_slice_continue: str | None
     completeness_issues: tuple[str, ...]
     pod_evidence: PodEvidence | None
+    network_policy_evidence: NetworkPolicyEvidence | None
+    traffic: TrafficContext | None
 
 
 @dataclass(frozen=True)

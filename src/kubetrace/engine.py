@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from ipaddress import IPv4Address, IPv6Address, ip_address
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -20,12 +20,23 @@ from kubetrace.models import (
     EndpointSlice,
     EndpointSliceRequest,
     EvidenceBundle,
+    IPBlock,
+    LabelSelector,
+    LabelSelectorRequirement,
+    NetworkPolicy,
+    NetworkPolicyEvidence,
+    NetworkPolicyListRequest,
+    NetworkPolicyPeer,
+    NetworkPolicyPort,
+    NetworkPolicyRule,
     ObservedEvidence,
     Outcome,
     Pod,
     PodEvidence,
     PodListRequest,
     Service,
+    TrafficContext,
+    TrafficPeer,
 )
 
 SERVICE_NAME_LABEL = "kubernetes.io/service-name"
@@ -38,6 +49,9 @@ MAX_FIXTURE_BYTES = 1_048_576
 MAX_ENDPOINT_SLICES = 256
 MAX_ENDPOINTS = 10_000
 MAX_PODS = 1_000
+MAX_NETWORK_POLICIES = 256
+MAX_NETWORK_POLICY_RULES = 2_048
+MAX_NETWORK_POLICY_RULE_ENTRIES = 10_000
 MAX_VALIDATION_ERRORS = 50
 
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
@@ -495,6 +509,7 @@ def _normalize_pod_evidence(
 
     request_value = pod_collection.get("request")
     request: PodListRequest | None = None
+    projected_label_keys: tuple[str, ...] | None = None
     if request_value is not None:
         request_object = _object(
             request_value, "collection.podListCollection.request", errors
@@ -511,6 +526,17 @@ def _normalize_pod_evidence(
                 errors,
             ),
         )
+        keys_value = request_object.get("projectedLabelKeys")
+        if keys_value is not None:
+            if not isinstance(keys_value, list) or not all(
+                isinstance(key, str) and key and key.isprintable() for key in keys_value
+            ):
+                errors.append(
+                    "collection.podListCollection.request.projectedLabelKeys must "
+                    "be a list of non-empty printable strings"
+                )
+            else:
+                projected_label_keys = tuple(sorted(set(keys_value)))
 
     pods: tuple[Pod, ...] | None = None
     resource_version: str | None = None
@@ -591,6 +617,453 @@ def _normalize_pod_evidence(
         resource_version=resource_version,
         continue_token=continue_token,
         completeness_issues=tuple(completeness_issues),
+        projected_label_keys=projected_label_keys,
+    )
+
+
+def _normalize_label_map(
+    value: Any, path: str, errors: list[str]
+) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        errors.append(f"{path} must be an object")
+        return ()
+    labels: list[tuple[str, str]] = []
+    for key, item in value.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or len(key) > 253
+            or not key.isprintable()
+        ):
+            errors.append(
+                f"{path} keys must be non-empty printable strings of at most 253 "
+                "characters"
+            )
+            continue
+        if not isinstance(item, str) or len(item) > 63 or not item.isprintable():
+            errors.append(
+                f"{path}.{key} must be a printable string of at most 63 characters"
+            )
+            continue
+        labels.append((key, item))
+    return tuple(sorted(labels))
+
+
+def _normalize_label_selector(
+    value: Any, path: str, errors: list[str]
+) -> LabelSelector:
+    selector = _object(value, path, errors)
+    match_labels = _normalize_label_map(
+        selector.get("matchLabels"), f"{path}.matchLabels", errors
+    )
+    expressions_value = selector.get("matchExpressions", [])
+    expressions: list[LabelSelectorRequirement] = []
+    if not isinstance(expressions_value, list):
+        errors.append(f"{path}.matchExpressions must be a list")
+    else:
+        for index, item in enumerate(expressions_value):
+            item_path = f"{path}.matchExpressions[{index}]"
+            expression = _object(item, item_path, errors)
+            key = _safe_string(
+                expression.get("key"),
+                f"{item_path}.key",
+                errors,
+                max_length=253,
+            )
+            operator = _required_string(
+                expression.get("operator"), f"{item_path}.operator", errors
+            )
+            values_value = expression.get("values", [])
+            values: tuple[str, ...] = ()
+            if not isinstance(values_value, list) or not all(
+                isinstance(entry, str) and len(entry) <= 63 and entry.isprintable()
+                for entry in values_value
+            ):
+                errors.append(f"{item_path}.values must be a list of printable strings")
+            else:
+                values = tuple(sorted(values_value))
+            if operator not in {"In", "NotIn", "Exists", "DoesNotExist"}:
+                errors.append(
+                    f"{item_path}.operator must be In, NotIn, Exists, or DoesNotExist"
+                )
+            elif operator in {"In", "NotIn"} and not values:
+                errors.append(f"{item_path}.values must not be empty for {operator}")
+            elif operator in {"Exists", "DoesNotExist"} and values:
+                errors.append(f"{item_path}.values must be empty for {operator}")
+            expressions.append(LabelSelectorRequirement(key, operator, values))
+    return LabelSelector(match_labels, tuple(sorted(expressions, key=repr)))
+
+
+def _normalize_policy_port(
+    value: Any, path: str, errors: list[str]
+) -> NetworkPolicyPort:
+    item = _object(value, path, errors)
+    protocol = item.get("protocol", "TCP")
+    if protocol not in {"TCP", "UDP", "SCTP"}:
+        errors.append(f"{path}.protocol must be TCP, UDP, or SCTP")
+        protocol = "TCP"
+    port = item.get("port")
+    if port is not None and (
+        isinstance(port, bool)
+        or not isinstance(port, int | str)
+        or isinstance(port, int)
+        and not 1 <= port <= 65535
+        or isinstance(port, str)
+        and (not port or not port.isprintable())
+    ):
+        errors.append(f"{path}.port must be a valid integer or named port")
+        port = None
+    end_port = item.get("endPort")
+    if end_port is not None and (
+        isinstance(end_port, bool)
+        or not isinstance(end_port, int)
+        or not isinstance(port, int)
+        or not port <= end_port <= 65535
+    ):
+        errors.append(f"{path}.endPort requires a numeric port and valid range")
+        end_port = None
+    return NetworkPolicyPort(protocol, port, end_port)
+
+
+def _normalize_ip_block(value: Any, path: str, errors: list[str]) -> IPBlock:
+    item = _object(value, path, errors)
+    cidr = _required_string(item.get("cidr"), f"{path}.cidr", errors)
+    network = None
+    try:
+        network = ip_network(cidr, strict=True)
+    except ValueError:
+        errors.append(f"{path}.cidr must be a canonical IPv4 or IPv6 network")
+    except TypeError:
+        pass
+    exceptions_value = item.get("except", [])
+    exceptions: list[str] = []
+    if not isinstance(exceptions_value, list):
+        errors.append(f"{path}.except must be a list")
+    else:
+        for index, exception in enumerate(exceptions_value):
+            try:
+                parsed = ip_network(exception, strict=True)
+            except (TypeError, ValueError):
+                errors.append(f"{path}.except[{index}] must be a canonical IP network")
+                continue
+            if network is not None and (
+                parsed.version != network.version or not parsed.subnet_of(network)
+            ):
+                errors.append(f"{path}.except[{index}] must be within {cidr}")
+            exceptions.append(str(parsed))
+    return IPBlock(cidr, tuple(sorted(exceptions)))
+
+
+def _normalize_policy_peer(
+    value: Any, path: str, errors: list[str]
+) -> NetworkPolicyPeer:
+    item = _object(value, path, errors)
+    pod_value = item.get("podSelector")
+    namespace_value = item.get("namespaceSelector")
+    ip_value = item.get("ipBlock")
+    if ip_value is not None and (pod_value is not None or namespace_value is not None):
+        errors.append(f"{path}.ipBlock cannot be combined with label selectors")
+    return NetworkPolicyPeer(
+        _normalize_label_selector(pod_value, f"{path}.podSelector", errors)
+        if pod_value is not None
+        else None,
+        _normalize_label_selector(namespace_value, f"{path}.namespaceSelector", errors)
+        if namespace_value is not None
+        else None,
+        _normalize_ip_block(ip_value, f"{path}.ipBlock", errors)
+        if ip_value is not None
+        else None,
+    )
+
+
+def _normalize_policy_rule(
+    value: Any, path: str, peer_field: str, errors: list[str]
+) -> NetworkPolicyRule:
+    item = _object(value, path, errors)
+    peers_value = item.get(peer_field, [])
+    ports_value = item.get("ports", [])
+    if not isinstance(peers_value, list):
+        errors.append(f"{path}.{peer_field} must be a list")
+        peers: tuple[NetworkPolicyPeer, ...] = ()
+    else:
+        peers = tuple(
+            _normalize_policy_peer(peer, f"{path}.{peer_field}[{index}]", errors)
+            for index, peer in enumerate(peers_value)
+        )
+    if not isinstance(ports_value, list):
+        errors.append(f"{path}.ports must be a list")
+        ports: tuple[NetworkPolicyPort, ...] = ()
+    else:
+        ports = tuple(
+            _normalize_policy_port(port, f"{path}.ports[{index}]", errors)
+            for index, port in enumerate(ports_value)
+        )
+    return NetworkPolicyRule(peers, ports)
+
+
+def _normalize_network_policy(
+    value: Any, index: int, errors: list[str]
+) -> NetworkPolicy:
+    path = f"networkPolicyList.items[{index}]"
+    item = _object(value, path, errors)
+    if item.get("apiVersion") != "networking.k8s.io/v1":
+        errors.append(f"{path}.apiVersion must be 'networking.k8s.io/v1'")
+    if item.get("kind") != "NetworkPolicy":
+        errors.append(f"{path}.kind must be 'NetworkPolicy'")
+    metadata = _object(item.get("metadata"), f"{path}.metadata", errors)
+    spec = _object(item.get("spec"), f"{path}.spec", errors)
+    ingress_value = spec.get("ingress", [])
+    egress_value = spec.get("egress", [])
+    ingress = (
+        tuple(
+            _normalize_policy_rule(
+                rule, f"{path}.spec.ingress[{rule_index}]", "from", errors
+            )
+            for rule_index, rule in enumerate(ingress_value)
+        )
+        if isinstance(ingress_value, list)
+        else ()
+    )
+    egress = (
+        tuple(
+            _normalize_policy_rule(
+                rule, f"{path}.spec.egress[{rule_index}]", "to", errors
+            )
+            for rule_index, rule in enumerate(egress_value)
+        )
+        if isinstance(egress_value, list)
+        else ()
+    )
+    if not isinstance(ingress_value, list):
+        errors.append(f"{path}.spec.ingress must be a list")
+    if not isinstance(egress_value, list):
+        errors.append(f"{path}.spec.egress must be a list")
+    types_value = spec.get("policyTypes")
+    if types_value is None:
+        policy_types = ("Ingress", "Egress") if egress else ("Ingress",)
+    elif not isinstance(types_value, list) or not all(
+        item_type in {"Ingress", "Egress"} for item_type in types_value
+    ):
+        errors.append(f"{path}.spec.policyTypes must contain Ingress or Egress")
+        policy_types = ()
+    else:
+        policy_types = tuple(sorted(set(types_value)))
+        if len(policy_types) != len(types_value):
+            errors.append(f"{path}.spec.policyTypes must not contain duplicates")
+    return NetworkPolicy(
+        namespace=_dns_label(
+            metadata.get("namespace"), f"{path}.metadata.namespace", errors
+        ),
+        name=_dns_subdomain(metadata.get("name"), f"{path}.metadata.name", errors),
+        uid=_safe_string(metadata.get("uid"), f"{path}.metadata.uid", errors),
+        pod_selector=_normalize_label_selector(
+            spec.get("podSelector"), f"{path}.spec.podSelector", errors
+        ),
+        policy_types=policy_types,
+        ingress=ingress,
+        egress=egress,
+    )
+
+
+def _normalize_network_policy_evidence(
+    raw: Mapping[str, Any],
+    collection: dict[str, Any],
+    scope: CollectionScope,
+    errors: list[str],
+) -> NetworkPolicyEvidence | None:
+    collection_value = collection.get("networkPolicyListCollection")
+    list_value = raw.get("networkPolicyList")
+    if collection_value is None and list_value is None:
+        return None
+    policy_collection = _object(
+        collection_value, "collection.networkPolicyListCollection", errors
+    )
+    status = _required_string(
+        policy_collection.get("status"),
+        "collection.networkPolicyListCollection.status",
+        errors,
+    )
+    if status not in {"complete", "incomplete"}:
+        errors.append(
+            "collection.networkPolicyListCollection.status must be complete or "
+            "incomplete"
+        )
+    issues = _normalize_collection_issues(
+        policy_collection.get("issues"),
+        status,
+        errors,
+        path="collection.networkPolicyListCollection.issues",
+    )
+    request_value = policy_collection.get("request")
+    request = None
+    if request_value is not None:
+        request_object = _object(
+            request_value, "collection.networkPolicyListCollection.request", errors
+        )
+        request = NetworkPolicyListRequest(
+            namespace=_optional_string(
+                request_object.get("namespace"),
+                "collection.networkPolicyListCollection.request.namespace",
+                errors,
+            )
+        )
+    policies: tuple[NetworkPolicy, ...] | None = None
+    resource_version: str | None = None
+    continue_token: str | None = None
+    if list_value is not None:
+        policy_list = _object(list_value, "networkPolicyList", errors)
+        if policy_list.get("apiVersion") != "networking.k8s.io/v1":
+            errors.append("networkPolicyList.apiVersion must be 'networking.k8s.io/v1'")
+        if policy_list.get("kind") != "NetworkPolicyList":
+            errors.append("networkPolicyList.kind must be 'NetworkPolicyList'")
+        metadata = _object(
+            policy_list.get("metadata"), "networkPolicyList.metadata", errors
+        )
+        resource_version = _optional_string(
+            metadata.get("resourceVersion"),
+            "networkPolicyList.metadata.resourceVersion",
+            errors,
+        )
+        continue_token = _optional_string(
+            metadata.get("continue"), "networkPolicyList.metadata.continue", errors
+        )
+        if resource_version is not None and not resource_version.isprintable():
+            errors.append(
+                "networkPolicyList.metadata.resourceVersion must be printable"
+            )
+        if continue_token is not None and not continue_token.isprintable():
+            errors.append("networkPolicyList.metadata.continue must be printable")
+        items = policy_list.get("items")
+        if isinstance(items, list):
+            if len(items) > MAX_NETWORK_POLICIES:
+                raise EvidenceValidationError(
+                    [
+                        "NetworkPolicy count exceeds the "
+                        f"{MAX_NETWORK_POLICIES}-policy limit"
+                    ]
+                )
+            policies = tuple(
+                sorted(
+                    (
+                        _normalize_network_policy(item, index, errors)
+                        for index, item in enumerate(items)
+                    ),
+                    key=lambda policy: policy.identity,
+                )
+            )
+            rule_count = sum(
+                len(policy.ingress) + len(policy.egress) for policy in policies
+            )
+            if rule_count > MAX_NETWORK_POLICY_RULES:
+                raise EvidenceValidationError(
+                    [
+                        "NetworkPolicy rule count exceeds the "
+                        f"{MAX_NETWORK_POLICY_RULES}-rule limit"
+                    ]
+                )
+            entry_count = sum(
+                len(rule.peers) + len(rule.ports)
+                for policy in policies
+                for rule in (*policy.ingress, *policy.egress)
+            )
+            if entry_count > MAX_NETWORK_POLICY_RULE_ENTRIES:
+                raise EvidenceValidationError(
+                    [
+                        "NetworkPolicy peer and port count exceeds the "
+                        f"{MAX_NETWORK_POLICY_RULE_ENTRIES}-entry limit"
+                    ]
+                )
+        else:
+            errors.append("networkPolicyList.items must be a list")
+    completeness = [f"{issue.operation}: {issue.message}" for issue in issues]
+    if status != "complete":
+        completeness.append("NetworkPolicy collection status is incomplete")
+    if request is None:
+        completeness.append("NetworkPolicy list-request provenance is missing")
+    elif request.namespace != scope.namespace:
+        completeness.append(
+            "NetworkPolicy list-request namespace does not match the Service"
+        )
+    if policies is None:
+        completeness.append("NetworkPolicy list evidence is missing")
+    else:
+        if not resource_version:
+            completeness.append("NetworkPolicy list has no resourceVersion snapshot")
+        if continue_token:
+            completeness.append(
+                "NetworkPolicy list pagination is incomplete (continue token present)"
+            )
+        identities = [policy.identity for policy in policies]
+        if len(identities) != len(set(identities)):
+            completeness.append("NetworkPolicy identities are duplicated")
+        uids = [policy.uid for policy in policies]
+        if len(uids) != len(set(uids)):
+            completeness.append("NetworkPolicy UIDs are duplicated")
+        if any(policy.namespace != scope.namespace for policy in policies):
+            completeness.append(
+                "NetworkPolicy list contains policies outside the requested namespace"
+            )
+    return NetworkPolicyEvidence(
+        status,
+        issues,
+        request,
+        policies,
+        resource_version,
+        continue_token,
+        tuple(completeness),
+    )
+
+
+def _normalize_traffic(
+    raw: Mapping[str, Any], errors: list[str]
+) -> TrafficContext | None:
+    value = raw.get("traffic")
+    if value is None:
+        return None
+    item = _object(value, "traffic", errors)
+    direction = _required_string(item.get("direction"), "traffic.direction", errors)
+    if direction not in {"ingress", "egress"}:
+        errors.append("traffic.direction must be ingress or egress")
+    protocol = _required_string(item.get("protocol"), "traffic.protocol", errors)
+    if protocol not in {"TCP", "UDP", "SCTP"}:
+        errors.append("traffic.protocol must be TCP, UDP, or SCTP")
+    port = item.get("port")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        errors.append("traffic.port must be an integer from 1 to 65535")
+        port = 0
+    peer_value = _object(item.get("peer"), "traffic.peer", errors)
+    namespace = _optional_string(
+        peer_value.get("namespace"), "traffic.peer.namespace", errors
+    )
+    ip_value = _optional_string(peer_value.get("ip"), "traffic.peer.ip", errors)
+    if ip_value is not None:
+        try:
+            ip_value = str(ip_address(ip_value))
+        except ValueError:
+            errors.append("traffic.peer.ip must be a valid IP address")
+    namespace_labels = (
+        _normalize_label_map(
+            peer_value.get("namespaceLabels"),
+            "traffic.peer.namespaceLabels",
+            errors,
+        )
+        if "namespaceLabels" in peer_value
+        else None
+    )
+    pod_labels = (
+        _normalize_label_map(
+            peer_value.get("podLabels"), "traffic.peer.podLabels", errors
+        )
+        if "podLabels" in peer_value
+        else None
+    )
+    return TrafficContext(
+        direction,
+        protocol,
+        port,
+        TrafficPeer(namespace, namespace_labels, pod_labels, ip_value),
     )
 
 
@@ -692,6 +1165,10 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
             errors.append("endpointSliceList.items must be a list")
 
     pod_evidence = _normalize_pod_evidence(raw, collection, scope, errors)
+    network_policy_evidence = _normalize_network_policy_evidence(
+        raw, collection, scope, errors
+    )
+    traffic = _normalize_traffic(raw, errors)
 
     if errors:
         raise EvidenceValidationError(errors)
@@ -759,6 +1236,8 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
         endpoint_slice_continue=continue_token,
         completeness_issues=tuple(completeness_issues),
         pod_evidence=pod_evidence,
+        network_policy_evidence=network_policy_evidence,
+        traffic=traffic,
     )
 
 
@@ -933,6 +1412,320 @@ def _pod_cause_analysis(
     )
 
 
+def _selector_keys(selector: LabelSelector) -> set[str]:
+    return {
+        *(key for key, _value in selector.match_labels),
+        *(requirement.key for requirement in selector.match_expressions),
+    }
+
+
+def _label_selector_matches(
+    selector: LabelSelector, labels: tuple[tuple[str, str], ...]
+) -> bool:
+    values = dict(labels)
+    if any(values.get(key) != expected for key, expected in selector.match_labels):
+        return False
+    for requirement in selector.match_expressions:
+        present = requirement.key in values
+        value = values.get(requirement.key)
+        if requirement.operator == "In" and (
+            not present or value not in requirement.values
+        ):
+            return False
+        if requirement.operator == "NotIn" and (
+            not present or value in requirement.values
+        ):
+            return False
+        if requirement.operator == "Exists" and not present:
+            return False
+        if requirement.operator == "DoesNotExist" and present:
+            return False
+    return True
+
+
+def _label_selector_is_empty(selector: LabelSelector) -> bool:
+    return not selector.match_labels and not selector.match_expressions
+
+
+def _policy_port_matches(
+    port: NetworkPolicyPort, traffic: TrafficContext
+) -> bool | None:
+    if port.protocol != traffic.protocol:
+        return False
+    if port.port is None:
+        return True
+    if isinstance(port.port, str):
+        return None
+    return port.port <= traffic.port <= (port.end_port or port.port)
+
+
+def _policy_peer_matches(
+    peer: NetworkPolicyPeer,
+    traffic: TrafficContext,
+    policy_namespace: str,
+) -> bool | None:
+    traffic_peer = traffic.peer
+    if peer.ip_block is not None:
+        if traffic_peer.ip is None:
+            return None
+        address = ip_address(traffic_peer.ip)
+        network = ip_network(peer.ip_block.cidr)
+        if address not in network:
+            return False
+        return not any(
+            address in ip_network(exception) for exception in peer.ip_block.exceptions
+        )
+    if peer.namespace_selector is not None:
+        if not _label_selector_is_empty(peer.namespace_selector):
+            if traffic_peer.namespace_labels is None:
+                return None
+            if not _label_selector_matches(
+                peer.namespace_selector, traffic_peer.namespace_labels
+            ):
+                return False
+    elif peer.pod_selector is not None:
+        if traffic_peer.namespace is None:
+            return None
+        if traffic_peer.namespace != policy_namespace:
+            return False
+    if peer.pod_selector is not None:
+        if not _label_selector_is_empty(peer.pod_selector):
+            if traffic_peer.pod_labels is None:
+                return None
+            if not _label_selector_matches(peer.pod_selector, traffic_peer.pod_labels):
+                return False
+    return True
+
+
+def _policy_rule_matches(
+    rule: NetworkPolicyRule,
+    traffic: TrafficContext,
+    policy_namespace: str,
+) -> bool | None:
+    port_results = (
+        tuple(_policy_port_matches(port, traffic) for port in rule.ports)
+        if rule.ports
+        else (True,)
+    )
+    if not any(result is True for result in port_results):
+        return None if any(result is None for result in port_results) else False
+    peer_results = (
+        tuple(
+            _policy_peer_matches(peer, traffic, policy_namespace) for peer in rule.peers
+        )
+        if rule.peers
+        else (True,)
+    )
+    if any(result is True for result in peer_results):
+        return True
+    return None if any(result is None for result in peer_results) else False
+
+
+def _pod_policy_result(
+    pod: Pod,
+    policies: tuple[NetworkPolicy, ...],
+    traffic: TrafficContext,
+) -> tuple[bool | None, tuple[NetworkPolicy, ...]]:
+    policy_type = traffic.direction.capitalize()
+    selected = tuple(
+        policy
+        for policy in policies
+        if policy_type in policy.policy_types
+        and _label_selector_matches(policy.pod_selector, pod.labels)
+    )
+    if not selected:
+        return True, ()
+    results = tuple(
+        _policy_rule_matches(rule, traffic, policy.namespace)
+        for policy in selected
+        for rule in (
+            policy.ingress if traffic.direction == "ingress" else policy.egress
+        )
+    )
+    if any(result is True for result in results):
+        return True, selected
+    if any(result is None for result in results):
+        return None, selected
+    return False, selected
+
+
+def _network_policy_analysis(
+    evidence: EvidenceBundle, service: Service
+) -> tuple[
+    tuple[ObservedEvidence, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    policy_evidence = evidence.network_policy_evidence
+    if policy_evidence is None:
+        return ((), (), (), ("NetworkPolicy evidence was not collected.",))
+    if policy_evidence.completeness_issues:
+        return (
+            (),
+            (),
+            (),
+            (
+                "NetworkPolicy evidence is incomplete, so it cannot support a "
+                "policy conclusion.",
+                *policy_evidence.completeness_issues,
+            ),
+        )
+    pod_evidence = evidence.pod_evidence
+    if pod_evidence is None or pod_evidence.completeness_issues:
+        return (
+            (),
+            (),
+            (),
+            ("Complete Pod evidence is required for NetworkPolicy selection.",),
+        )
+    policies = policy_evidence.policies or ()
+    required_keys = {
+        key for policy in policies for key in _selector_keys(policy.pod_selector)
+    }
+    projected_keys = set(pod_evidence.projected_label_keys or ())
+    if not required_keys.issubset(projected_keys):
+        return (
+            (),
+            (),
+            (),
+            (
+                "Pod label projection does not cover every NetworkPolicy target "
+                "selector key.",
+            ),
+        )
+    pods = pod_evidence.pods or ()
+    service_pods = tuple(pod for pod in pods if _pod_matches_selector(pod, service))
+    observation = ObservedEvidence(
+        statement=(
+            f"Complete NetworkPolicy snapshot contains {len(policies)} policies; "
+            f"{len(service_pods)} observed Pods match the Service selector"
+        ),
+        source=evidence.source,
+        source_collected_at=evidence.source_collected_at,
+        collected_at=evidence.collected_at,
+        resource=(
+            f"NetworkPolicyList/{evidence.scope.namespace}"
+            f"@{policy_evidence.resource_version}"
+        ),
+        transformations=(
+            f"validated against {EVIDENCE_SCHEMA_VERSION}",
+            "matched Kubernetes LabelSelectors and unioned applicable policy rules",
+        ),
+    )
+    if not service_pods:
+        return (
+            (observation,),
+            ("No observed Pod behind the Service was available for policy selection.",),
+            (),
+            (
+                "NetworkPolicy effects cannot be evaluated without an observed "
+                "Service-selected Pod.",
+            ),
+        )
+    ingress_selected = sum(
+        any(
+            "Ingress" in policy.policy_types
+            and _label_selector_matches(policy.pod_selector, pod.labels)
+            for policy in policies
+        )
+        for pod in service_pods
+    )
+    egress_selected = sum(
+        any(
+            "Egress" in policy.policy_types
+            and _label_selector_matches(policy.pod_selector, pod.labels)
+            for policy in policies
+        )
+        for pod in service_pods
+    )
+    isolation = (
+        f"NetworkPolicy selects {ingress_selected}/{len(service_pods)} Service Pods "
+        f"for ingress isolation and {egress_selected}/{len(service_pods)} for "
+        "egress isolation."
+    )
+    enforcement_limit = (
+        "Policy objects describe intended isolation but do not prove that a network "
+        "plugin enforces NetworkPolicy."
+    )
+    if evidence.traffic is None:
+        possible = (
+            ("NetworkPolicies may restrict traffic involving the Service Pods.",)
+            if ingress_selected or egress_selected
+            else ()
+        )
+        return (
+            (observation,),
+            (isolation,),
+            possible,
+            (
+                "Source or destination, direction, protocol, and port context is "
+                "required to evaluate a specific flow.",
+                enforcement_limit,
+            ),
+        )
+    traffic = evidence.traffic
+    if traffic.peer.namespace is None and traffic.peer.ip is None:
+        return (
+            (observation,),
+            (isolation,),
+            ("NetworkPolicies may restrict the described traffic.",),
+            (
+                "Peer source or destination identity is missing, so a specific "
+                "policy path cannot be evaluated.",
+                enforcement_limit,
+            ),
+        )
+    results = tuple(
+        _pod_policy_result(pod, policies, traffic)[0] for pod in service_pods
+    )
+    allowed = sum(result is True for result in results)
+    denied = sum(result is False for result in results)
+    unknown = sum(result is None for result in results)
+    description = f"{traffic.protocol}/{traffic.port} {traffic.direction} traffic"
+    if denied == len(service_pods):
+        return (
+            (observation,),
+            (
+                isolation,
+                f"The union of applicable NetworkPolicy rules does not allow the "
+                f"described {description} for any of the {len(service_pods)} "
+                "Service Pods.",
+            ),
+            ("NetworkPolicy enforcement may restrict the described traffic.",),
+            (
+                enforcement_limit,
+                "A policy-spec deny is not proof that an observed connection was "
+                "blocked by NetworkPolicy.",
+            ),
+        )
+    if unknown:
+        return (
+            (observation,),
+            (isolation,),
+            ("NetworkPolicies may restrict the described traffic.",),
+            (
+                f"Policy evaluation is unresolved for {unknown} Service Pods; named "
+                "ports or missing peer labels may require additional evidence.",
+                enforcement_limit,
+            ),
+        )
+    return (
+        (observation,),
+        (
+            isolation,
+            f"The union of applicable NetworkPolicy rules allows the described "
+            f"{description} for {allowed}/{len(service_pods)} Service Pods.",
+        ),
+        (
+            ("NetworkPolicies may restrict some Service Pods for this traffic.",)
+            if denied
+            else ()
+        ),
+        (enforcement_limit,),
+    )
+
+
 def evaluate_service_no_ready_endpoints(
     evidence: EvidenceBundle,
 ) -> DiagnosticReport:
@@ -944,7 +1737,12 @@ def evaluate_service_no_ready_endpoints(
         if evidence.pod_evidence is not None
         else ()
     )
-    collection_issues = (*evidence.collection_issues, *pod_issues)
+    policy_issues = (
+        evidence.network_policy_evidence.collection_issues
+        if evidence.network_policy_evidence is not None
+        else ()
+    )
+    collection_issues = (*evidence.collection_issues, *pod_issues, *policy_issues)
     if service is None:
         identity = f"{evidence.scope.namespace}/{evidence.scope.service_name}"
         return DiagnosticReport(
@@ -1060,6 +1858,18 @@ def evaluate_service_no_ready_endpoints(
 
     if ready_count:
         unknown_label = "endpoint has" if unknown_count == 1 else "endpoints have"
+        if evidence.network_policy_evidence is None or service.selector is None:
+            policy_observations: tuple[ObservedEvidence, ...] = ()
+            policy_findings: tuple[str, ...] = ()
+            policy_causes: tuple[str, ...] = ()
+            policy_limitations: tuple[str, ...] = ()
+        else:
+            (
+                policy_observations,
+                policy_findings,
+                policy_causes,
+                policy_limitations,
+            ) = _network_policy_analysis(evidence, service)
         return DiagnosticReport(
             rule_id=RULE_ID,
             outcome=Outcome.NO_FINDING,
@@ -1067,14 +1877,20 @@ def evaluate_service_no_ready_endpoints(
             target=evidence.scope,
             service=service,
             collection_issues=collection_issues,
-            observed_evidence=observations,
-            derived_findings=("At least one logical endpoint is explicitly ready.",),
-            possible_causes=(),
+            observed_evidence=(*observations, *policy_observations),
+            derived_findings=(
+                "At least one logical endpoint is explicitly ready.",
+                *policy_findings,
+            ),
+            possible_causes=policy_causes,
             confirmed_causes=(),
             limitations=(
-                (f"{unknown_count} {unknown_label} unknown readiness.",)
-                if unknown_count
-                else ()
+                *(
+                    (f"{unknown_count} {unknown_label} unknown readiness.",)
+                    if unknown_count
+                    else ()
+                ),
+                *policy_limitations,
             ),
         )
 
@@ -1114,6 +1930,18 @@ def evaluate_service_no_ready_endpoints(
             confirmed_causes,
             limitations,
         ) = _pod_cause_analysis(evidence, service)
+    if evidence.network_policy_evidence is None:
+        policy_observations: tuple[ObservedEvidence, ...] = ()
+        policy_findings: tuple[str, ...] = ()
+        policy_causes: tuple[str, ...] = ()
+        policy_limitations: tuple[str, ...] = ()
+    else:
+        (
+            policy_observations,
+            policy_findings,
+            policy_causes,
+            policy_limitations,
+        ) = _network_policy_analysis(evidence, service)
     return DiagnosticReport(
         rule_id=RULE_ID,
         outcome=Outcome.FINDING,
@@ -1121,15 +1949,20 @@ def evaluate_service_no_ready_endpoints(
         target=evidence.scope,
         service=service,
         collection_issues=collection_issues,
-        observed_evidence=(*observations, *pod_observations),
+        observed_evidence=(
+            *observations,
+            *pod_observations,
+            *policy_observations,
+        ),
         derived_findings=(
             "The complete associated EndpointSlice snapshot contains zero "
             "explicitly ready logical endpoints.",
             *pod_findings,
+            *policy_findings,
         ),
-        possible_causes=possible_causes,
+        possible_causes=(*possible_causes, *policy_causes),
         confirmed_causes=confirmed_causes,
-        limitations=limitations,
+        limitations=(*limitations, *policy_limitations),
     )
 
 

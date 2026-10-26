@@ -4,8 +4,9 @@ KubeTrace is a lightweight, evidence-based diagnostic tool for Kubernetes
 networking investigations. It currently evaluates the deterministic
 `SERVICE_NO_READY_ENDPOINTS` rule from either a JSON fixture or read-only
 Kubernetes API evidence. When a selector-based Service has no ready endpoints,
-optional Pod evidence can identify a bounded selector or readiness condition
-without asserting why that condition occurred.
+optional Pod evidence can identify a bounded selector or readiness condition,
+and NetworkPolicy evidence can show whether policy specifications may restrict
+traffic involving the Service Pods.
 
 KubeTrace is not a general-purpose monitoring platform. It produces a bounded,
 versioned diagnostic report that separates observations, derived findings,
@@ -15,19 +16,21 @@ possible causes, confirmed causes, and limitations.
 
 Both input modes use the same pipeline:
 
-1. A collector obtains Service, EndpointSlice, and—when needed—Pod evidence.
+1. A collector obtains Service, EndpointSlice, Pod, and NetworkPolicy evidence
+   when the investigation requires it.
 2. The engine validates and normalizes the evidence into typed domain models.
 3. A deterministic rule evaluates the normalized evidence.
 4. The reporter writes versioned JSON to standard output and a terminal-safe
    one-line summary to standard error.
 
 The Kubernetes collector uses only `read_namespaced_service`,
-`list_namespaced_endpoint_slice`, and `list_namespaced_pod`. It follows
+`list_namespaced_endpoint_slice`, `list_namespaced_pod`, and
+`list_namespaced_network_policy`. It follows
 pagination, requires a consistent non-empty resource version for each list, and
 applies bounded page, object, timeout, and elapsed-time limits. Pod collection
 is attempted only after complete EndpointSlice evidence establishes zero ready
-endpoints for a selector-based Service. Partial or failed evidence is never
-treated as proof of a cause.
+endpoints for a selector-based Service or when NetworkPolicy selection must be
+evaluated. Partial or failed evidence is never treated as proof of a cause.
 
 ## Prerequisites and installation
 
@@ -92,11 +95,24 @@ authorization, connectivity, and API collection failures are emitted as
 sanitized collection issues; kubeconfig contents, credentials, response bodies,
 and raw exception text are not included in reports.
 
+An optional traffic description enables evaluation of a specific policy path:
+
+```powershell
+python -m kubetrace kubernetes --namespace shop --service checkout `
+  --direction ingress --protocol TCP --port 443 `
+  --peer-namespace client --peer-namespace-label team=trusted `
+  --peer-pod-label app=caller --peer-ip 192.0.2.10
+```
+
+Peer namespace and Pod labels are necessary when matching selectors use them.
+The peer IP is necessary for `ipBlock` evaluation. Missing details produce an
+explicitly limited result rather than an assumed allow or deny.
+
 ## Kubernetes permissions
 
 The active identity needs `get` permission for Services and `list` permission
-for EndpointSlices and Pods in the target namespace. A namespace-scoped Role
-can express those permissions:
+for EndpointSlices, Pods, and NetworkPolicies in the target namespace. A
+namespace-scoped Role can express those permissions:
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -113,6 +129,9 @@ rules:
     verbs: ["list"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
+    verbs: ["list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
     verbs: ["list"]
 ```
 
@@ -162,6 +181,22 @@ Incomplete Pod collection leaves `confirmedCauses` empty and records collection
 issues and limitations; it does not erase a no-ready-endpoints finding already
 established from complete EndpointSlice evidence.
 
+### NetworkPolicy analysis
+
+For observed Pods selected by the Service, KubeTrace identifies policies that
+select each Pod for ingress or egress isolation. It implements Kubernetes label
+selector semantics, direction-specific policy types, default-deny behavior,
+the union of allow rules across applicable policies, protocol and numeric port
+ranges, combined namespace and Pod selectors, and `ipBlock` exceptions.
+
+With complete direction, peer, protocol, and port evidence, KubeTrace can state
+whether the union of the observed policy specifications allows the described
+traffic. A policy-spec deny is reported as a possible restriction, never as a
+confirmed root cause. Policy objects alone do not prove that the cluster network
+plugin enforces NetworkPolicy, and a selected Pod is not necessarily blocked.
+Named policy ports remain unresolved because KubeTrace does not collect
+container-port mappings.
+
 Diagnostic outcomes are:
 
 - `finding`: complete evidence establishes zero explicitly ready endpoints.
@@ -186,13 +221,16 @@ timestamps obtained at runtime.
 ## Resource limits
 
 Fixture input is limited to 1,048,576 bytes, 256 EndpointSlices, 10,000 endpoint
-records, and 50 accumulated validation errors.
+records, 1,000 Pods, 256 NetworkPolicies, 2,048 policy rules, 10,000 policy peer
+and port entries, and 50 accumulated validation errors.
 
 Kubernetes collection defaults to 100 objects per page. Each paginated list is
 bounded to 16 pages; collection is additionally bounded to 256 EndpointSlices,
-10,000 endpoint records, 1,000 Pods, and 15 elapsed seconds. Requests use a
+10,000 endpoint records, 1,000 Pods, 256 NetworkPolicies, 2,048 policy rules,
+10,000 policy peer and port entries, and 15 elapsed seconds. Requests use a
 three-second connect timeout and ten-second read timeout. Pod evidence retains
-only identity, the Service selector's label keys, and the Pod Ready condition.
+only identity, required selector label keys, and the Pod Ready condition.
+NetworkPolicy projection omits annotations and unrelated metadata.
 
 ## Development checks
 
@@ -213,6 +251,10 @@ cluster, network access, Docker, Minikube, root, or eBPF support.
 ## Limitations
 
 - Only `SERVICE_NO_READY_ENDPOINTS` is implemented.
+- NetworkPolicy analysis describes policy specifications and cannot verify
+  enforcement or prove that an observed connection was denied.
+- Cilium policy CRDs and other provider-specific policy resources are not
+  collected.
 - Live-cluster compatibility is not covered by the automated test suite.
 - Cilium/Hubble flow collection and Linux/eBPF tracing are not implemented.
 - Service names use the portable RFC 1035 label rule; feature-gated relaxed
