@@ -1,0 +1,95 @@
+{
+  "schemaVersion": "kubetrace.evidence/v1",
+  "collection": {
+    "source": "fixture",
+    "collectedAt": "2026-10-26T12:00:00Z",
+    "status": "complete",
+    "scope": {"namespace": "shop", "serviceName": "checkout"},
+    "endpointSliceListRequest": {
+      "namespace": "shop",
+      "labelSelector": "kubernetes.io/service-name=checkout"
+    },
+    "podListCollection": {
+      "status": "incomplete",
+      "request": {"namespace": "shop", "labelSelector": ""},
+      "issues": [
+        {
+          "operation": "list_namespaced_pod",
+          "code": "forbidden",
+          "message": "Kubernetes API access was denied.",
+          "status": 403
+        }
+      ]
+    },
+    "hubbleFlowCollection": {
+      "status": "incomplete",
+      "window": {
+        "start": "2026-10-26T11:59:00Z",
+        "end": "2026-10-26T12:00:00Z"
+      },
+      "truncated": true,
+      "issues": [
+        {
+          "operation": "observe_flows",
+          "code": "timeout",
+          "message": "Hubble observation timed out.",
+          "status": null
+        }
+      ]
+    }
+  },
+  "service": {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {"namespace": "shop", "name": "checkout", "uid": "incident-svc"},
+    "spec": {"type": "ClusterIP", "selector": {"app": "checkout"}}
+  },
+  "endpointSliceList": {
+    "apiVersion": "discovery.k8s.io/v1",
+    "kind": "EndpointSliceList",
+    "metadata": {"resourceVersion": "101", "continue": ""},
+    "items": [
+      {
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "addressType": "IPv4",
+        "metadata": {
+          "namespace": "shop",
+          "name": "checkout-incident",
+          "labels": {"kubernetes.io/service-name": "checkout"}
+        },
+        "endpoints": [{"addresses": ["10.244.0.10"], "conditions": {}}]
+      }
+    ]
+  },
+  "traffic": {
+    "direction": "ingress",
+    "protocol": "TCP",
+    "port": 443,
+    "peer": {"namespace": "client", "ip": "192.0.2.10"}
+  },
+  "flows": [
+    {
+      "timestamp": "2026-10-26T11:59:45Z",
+      "verdict": "DROPPED",
+      "direction": "ingress",
+      "source": {
+        "namespace": "client",
+        "pod": "caller",
+        "identity": 2,
+        "ip": "192.0.2.10"
+      },
+      "destination": {
+        "namespace": null,
+        "pod": null,
+        "identity": 3,
+        "ip": null
+      },
+      "protocol": "TCP",
+      "sourcePort": 40000,
+      "destinationPort": 443,
+      "dropReason": "POLICY_DENIED",
+      "policyRelated": true
+    }
+  ]
+}

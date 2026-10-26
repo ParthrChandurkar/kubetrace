@@ -1,0 +1,100 @@
+{
+  "schemaVersion": "kubetrace.evidence/v1",
+  "collection": {
+    "source": "fixture",
+    "collectedAt": "2026-10-26T12:00:00Z",
+    "status": "complete",
+    "scope": {"namespace": "shop", "serviceName": "checkout"},
+    "endpointSliceListRequest": {
+      "namespace": "shop",
+      "labelSelector": "kubernetes.io/service-name=checkout"
+    },
+    "podListCollection": {
+      "status": "complete",
+      "request": {"namespace": "shop", "labelSelector": ""}
+    },
+    "hubbleFlowCollection": {
+      "status": "complete",
+      "window": {
+        "start": "2026-10-26T11:59:00Z",
+        "end": "2026-10-26T12:00:00Z"
+      },
+      "truncated": false,
+      "issues": []
+    }
+  },
+  "service": {
+    "apiVersion": "v1",
+    "kind": "Service",
+    "metadata": {"namespace": "shop", "name": "checkout", "uid": "incident-svc"},
+    "spec": {"type": "ClusterIP", "selector": {"app": "checkout"}}
+  },
+  "endpointSliceList": {
+    "apiVersion": "discovery.k8s.io/v1",
+    "kind": "EndpointSliceList",
+    "metadata": {"resourceVersion": "101", "continue": ""},
+    "items": [
+      {
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "addressType": "IPv4",
+        "metadata": {
+          "namespace": "shop",
+          "name": "checkout-incident",
+          "labels": {"kubernetes.io/service-name": "checkout"}
+        },
+        "endpoints": [
+          {"addresses": ["10.244.0.10"], "conditions": {"ready": true}}
+        ]
+      }
+    ]
+  },
+  "podList": {
+    "apiVersion": "v1",
+    "kind": "PodList",
+    "metadata": {"resourceVersion": "201", "continue": ""},
+    "items": [
+      {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+          "namespace": "shop",
+          "name": "checkout-incident",
+          "uid": "incident-pod",
+          "labels": {"app": "checkout"}
+        },
+        "status": {"ready": true}
+      }
+    ]
+  },
+  "traffic": {
+    "direction": "ingress",
+    "protocol": "TCP",
+    "port": 443,
+    "peer": {"namespace": "client", "ip": "192.0.2.10"}
+  },
+  "flows": [
+    {
+      "timestamp": "2026-10-26T11:59:45Z",
+      "verdict": "DROPPED",
+      "direction": "ingress",
+      "source": {
+        "namespace": "client",
+        "pod": "caller",
+        "identity": 2,
+        "ip": "192.0.2.10"
+      },
+      "destination": {
+        "namespace": "shop",
+        "pod": "checkout-incident",
+        "identity": 3,
+        "ip": "10.244.0.10"
+      },
+      "protocol": "TCP",
+      "sourcePort": 40000,
+      "destinationPort": 443,
+      "dropReason": "CT_UNKNOWN",
+      "policyRelated": false
+    }
+  ]
+}

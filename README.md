@@ -79,6 +79,27 @@ The explicit form is equivalent:
 python -m kubetrace fixture fixtures/service-no-ready-endpoints.json
 ```
 
+### Incident scenarios
+
+The checked-in fixture scenarios demonstrate investigations for Services with
+no ready endpoints, matching Pods that are explicitly unready, selectors that
+match no observed Pods, potential NetworkPolicy restrictions, explicit Hubble
+policy-denial metadata, unattributed Hubble drops, incomplete evidence, and
+forwarded traffic observed alongside an independent readiness problem. Each
+fixture passes through the same collection, normalization, deterministic rule,
+correlation, explanation, guidance, and reporting pipeline used by fixture
+mode.
+
+For example, an explicit policy-denial correlation can be inspected with:
+
+```powershell
+python -m kubetrace fixture fixtures/incident-explicit-policy-denial.json
+```
+
+The scenario report distinguishes the observed Hubble verdict from Kubernetes
+policy configuration and retains the limitation that their agreement does not
+identify a specific policy or enforcement component as the cause.
+
 ### Kubernetes API evidence
 
 Select one namespaced Service with required namespace and Service arguments:
