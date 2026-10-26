@@ -16,6 +16,11 @@ from kubetrace.engine import (
     FixtureCollector,
     run_diagnostic,
 )
+from kubetrace.hubble_collector import (
+    HubbleClient,
+    HubbleCollector,
+    SubprocessHubbleClient,
+)
 from kubetrace.kubernetes_collector import KubernetesCollector
 from kubetrace.models import EVIDENCE_SCHEMA_VERSION, DiagnosticReport
 from kubetrace.reporting import report_payload, to_json, validation_error_payload
@@ -118,6 +123,13 @@ def _parser() -> argparse.ArgumentParser:
     kubernetes.add_argument(
         "--peer-pod-label", action="append", default=[], metavar="KEY=VALUE"
     )
+    kubernetes.add_argument(
+        "--hubble", action="store_true", help="collect an optional Hubble flow window"
+    )
+    kubernetes.add_argument("--hubble-executable", default="hubble")
+    kubernetes.add_argument("--hubble-server")
+    kubernetes.add_argument("--hubble-window-seconds", type=int, default=60)
+    kubernetes.add_argument("--hubble-max-flows", type=int, default=100)
     return parser
 
 
@@ -250,6 +262,7 @@ def _run_kubernetes(
         [str, str, str | None, str | None, Mapping[str, Any] | None],
         _KubernetesSession,
     ],
+    hubble_client_factory: Callable[[str, str | None], HubbleClient],
 ) -> DiagnosticReport:
     traffic = _traffic_from_arguments(arguments)
     try:
@@ -271,7 +284,26 @@ def _run_kubernetes(
         )
 
     try:
-        return run_diagnostic(session.collector)
+        collector = session.collector
+        if arguments.hubble:
+            if not 1 <= arguments.hubble_window_seconds <= 3600:
+                raise EvidenceValidationError(
+                    ["--hubble-window-seconds must be between 1 and 3600"]
+                )
+            if not 1 <= arguments.hubble_max_flows <= 1000:
+                raise EvidenceValidationError(
+                    ["--hubble-max-flows must be between 1 and 1000"]
+                )
+            collector = HubbleCollector(
+                collector,
+                hubble_client_factory(
+                    arguments.hubble_executable, arguments.hubble_server
+                ),
+                lambda: datetime.now(UTC),
+                window_seconds=arguments.hubble_window_seconds,
+                max_flows=arguments.hubble_max_flows,
+            )
+        return run_diagnostic(collector)
     finally:
         _close_quietly(session.close)
 
@@ -283,6 +315,9 @@ def main(
         [str, str, str | None, str | None, Mapping[str, Any] | None],
         _KubernetesSession,
     ] = _create_kubernetes_session,
+    hubble_client_factory: Callable[
+        [str, str | None], HubbleClient
+    ] = SubprocessHubbleClient,
 ) -> int:
     """Run one investigation and write its versioned report."""
 
@@ -291,7 +326,9 @@ def main(
         if arguments.mode == "fixture":
             report = run_diagnostic(FixtureCollector(arguments.path))
         else:
-            report = _run_kubernetes(arguments, kubernetes_session_factory)
+            report = _run_kubernetes(
+                arguments, kubernetes_session_factory, hubble_client_factory
+            )
     except EvidenceValidationError as error:
         print(to_json(validation_error_payload(error.errors)), end="")
         print(_terminal_safe(f"VALIDATION_ERROR: {error}"), file=sys.stderr)

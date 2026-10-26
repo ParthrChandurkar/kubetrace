@@ -46,6 +46,7 @@ def write_fixture(tmp_path: Path, evidence: dict[str, Any]) -> Path:
         ("service-selector-matches-no-pods.json", "finding"),
         ("service-matching-pods-not-ready.json", "finding"),
         ("service-networkpolicy-ingress-default-deny.json", "finding"),
+        ("service-hubble-policy-drop.json", "finding"),
     ],
 )
 def test_cli_checked_in_fixture_outcomes(filename: str, outcome: str, capsys) -> None:

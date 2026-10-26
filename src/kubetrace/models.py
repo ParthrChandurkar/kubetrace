@@ -196,6 +196,39 @@ class TrafficContext:
 
 
 @dataclass(frozen=True)
+class FlowEndpoint:
+    namespace: str | None
+    pod_name: str | None
+    identity: int | None
+    ip: str | None
+
+
+@dataclass(frozen=True)
+class Flow:
+    timestamp: str
+    verdict: str
+    direction: str | None
+    source: FlowEndpoint
+    destination: FlowEndpoint
+    protocol: str | None
+    source_port: int | None
+    destination_port: int | None
+    drop_reason: str | None
+    policy_related: bool | None
+
+
+@dataclass(frozen=True)
+class FlowEvidence:
+    collection_status: str
+    collection_issues: tuple[CollectionIssue, ...]
+    window_start: str | None
+    window_end: str | None
+    flows: tuple[Flow, ...]
+    truncated: bool
+    completeness_issues: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class EvidenceBundle:
     source: str
     source_collected_at: str
@@ -212,6 +245,7 @@ class EvidenceBundle:
     pod_evidence: PodEvidence | None
     network_policy_evidence: NetworkPolicyEvidence | None
     traffic: TrafficContext | None
+    flow_evidence: FlowEvidence | None = None
 
 
 @dataclass(frozen=True)

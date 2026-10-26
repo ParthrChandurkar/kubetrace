@@ -6,7 +6,8 @@ networking investigations. It currently evaluates the deterministic
 Kubernetes API evidence. When a selector-based Service has no ready endpoints,
 optional Pod evidence can identify a bounded selector or readiness condition,
 and NetworkPolicy evidence can show whether policy specifications may restrict
-traffic involving the Service Pods.
+traffic involving the Service Pods. Optional Hubble flow evidence can correlate
+forwarded and dropped traffic with those Pods over a bounded time window.
 
 KubeTrace is not a general-purpose monitoring platform. It produces a bounded,
 versioned diagnostic report that separates observations, derived findings,
@@ -17,7 +18,7 @@ possible causes, confirmed causes, and limitations.
 Both input modes use the same pipeline:
 
 1. A collector obtains Service, EndpointSlice, Pod, and NetworkPolicy evidence
-   when the investigation requires it.
+   when the investigation requires it, plus optional metadata-only Hubble flows.
 2. The engine validates and normalizes the evidence into typed domain models.
 3. A deterministic rule evaluates the normalized evidence.
 4. The reporter writes versioned JSON to standard output and a terminal-safe
@@ -48,6 +49,10 @@ python -m pip install ".[kubernetes]"
 Installing the extra does not establish cluster reachability, credentials, or
 RBAC permissions. KubeTrace loads the Kubernetes package and kubeconfig only
 when Kubernetes mode is selected.
+
+Optional flow collection uses an existing `hubble` CLI installation and its
+configured access to Hubble Relay. KubeTrace does not install or configure
+Cilium, Hubble, credentials, or relay connectivity.
 
 ## Usage
 
@@ -107,6 +112,18 @@ python -m kubetrace kubernetes --namespace shop --service checkout `
 Peer namespace and Pod labels are necessary when matching selectors use them.
 The peer IP is necessary for `ipBlock` evaluation. Missing details produce an
 explicitly limited result rather than an assumed allow or deny.
+
+Add a bounded Hubble observation to the same investigation with:
+
+```powershell
+python -m kubetrace kubernetes --namespace shop --service checkout `
+  --direction ingress --protocol TCP --port 443 --peer-ip 192.0.2.10 `
+  --hubble --hubble-window-seconds 60 --hubble-max-flows 100
+```
+
+Use `--hubble-server` to select a relay endpoint and `--hubble-executable` when
+the executable is not named `hubble`. The adapter invokes an argument array,
+not a shell, and retains only flow metadata needed for correlation.
 
 ## Kubernetes permissions
 
@@ -197,6 +214,20 @@ plugin enforces NetworkPolicy, and a selected Pod is not necessarily blocked.
 Named policy ports remain unresolved because KubeTrace does not collect
 container-port mappings.
 
+### Hubble flow analysis
+
+KubeTrace correlates a bounded Hubble window with observed Pods selected by the
+Service and, when supplied, the traffic direction, protocol, destination port,
+peer namespace, and peer IP. It reports matching forwarded and dropped verdicts.
+Only a dropped verdict carrying explicit Hubble policy metadata supports a
+confirmed immediate policy-drop condition. Generic drops remain unattributed,
+and policy objects alone are not used to relabel them.
+
+An empty flow window means that no matching flow was observed; it does not prove
+that traffic did not occur. A forwarded verdict does not prove application-level
+success. Unavailable, malformed, oversized, timed-out, or truncated Hubble
+collection is reported as incomplete and cannot confirm a Hubble-derived cause.
+
 Diagnostic outcomes are:
 
 - `finding`: complete evidence establishes zero explicitly ready endpoints.
@@ -222,7 +253,7 @@ timestamps obtained at runtime.
 
 Fixture input is limited to 1,048,576 bytes, 256 EndpointSlices, 10,000 endpoint
 records, 1,000 Pods, 256 NetworkPolicies, 2,048 policy rules, 10,000 policy peer
-and port entries, and 50 accumulated validation errors.
+and port entries, 1,000 flows, and 50 accumulated validation errors.
 
 Kubernetes collection defaults to 100 objects per page. Each paginated list is
 bounded to 16 pages; collection is additionally bounded to 256 EndpointSlices,
@@ -231,6 +262,9 @@ bounded to 16 pages; collection is additionally bounded to 256 EndpointSlices,
 three-second connect timeout and ten-second read timeout. Pod evidence retains
 only identity, required selector label keys, and the Pod Ready condition.
 NetworkPolicy projection omits annotations and unrelated metadata.
+Hubble collection defaults to a 60-second window and 100 flows, permits at most
+3,600 seconds and 1,000 flows, uses a ten-second command timeout, and accepts at
+most 1,048,576 output bytes. Packet payloads are never retained.
 
 ## Development checks
 
@@ -256,7 +290,10 @@ cluster, network access, Docker, Minikube, root, or eBPF support.
 - Cilium policy CRDs and other provider-specific policy resources are not
   collected.
 - Live-cluster compatibility is not covered by the automated test suite.
-- Cilium/Hubble flow collection and Linux/eBPF tracing are not implemented.
+- Hubble integration currently supports newline-delimited JSON emitted by the
+  Hubble CLI; direct Relay gRPC access and live compatibility testing are not
+  implemented.
+- Linux/eBPF tracing is not implemented.
 - Service names use the portable RFC 1035 label rule; feature-gated relaxed
   Service-name validation is not modeled.
 - The evidence and report schemas are versioned but may evolve before the first

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from pathlib import Path
@@ -20,6 +21,9 @@ from kubetrace.models import (
     EndpointSlice,
     EndpointSliceRequest,
     EvidenceBundle,
+    Flow,
+    FlowEndpoint,
+    FlowEvidence,
     IPBlock,
     LabelSelector,
     LabelSelectorRequirement,
@@ -52,6 +56,7 @@ MAX_PODS = 1_000
 MAX_NETWORK_POLICIES = 256
 MAX_NETWORK_POLICY_RULES = 2_048
 MAX_NETWORK_POLICY_RULE_ENTRIES = 10_000
+MAX_FLOWS = 1_000
 MAX_VALIDATION_ERRORS = 50
 
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
@@ -1067,6 +1072,148 @@ def _normalize_traffic(
     )
 
 
+def _normalize_flow_endpoint(value: Any, path: str, errors: list[str]) -> FlowEndpoint:
+    item = _object(value, path, errors)
+    namespace = _optional_string(item.get("namespace"), f"{path}.namespace", errors)
+    pod_name = _optional_string(item.get("pod"), f"{path}.pod", errors)
+    identity = item.get("identity")
+    if identity is not None and (
+        isinstance(identity, bool) or not isinstance(identity, int)
+    ):
+        errors.append(f"{path}.identity must be an integer or null")
+        identity = None
+    ip_value = _optional_string(item.get("ip"), f"{path}.ip", errors)
+    if ip_value:
+        try:
+            ip_value = str(ip_address(ip_value))
+        except ValueError:
+            errors.append(f"{path}.ip must be a valid IP address")
+    return FlowEndpoint(namespace, pod_name, identity, ip_value)
+
+
+def _normalize_flow_evidence(
+    raw: Mapping[str, Any], collection: dict[str, Any], errors: list[str]
+) -> FlowEvidence | None:
+    collection_value = collection.get("hubbleFlowCollection")
+    flows_value = raw.get("flows")
+    if collection_value is None and flows_value is None:
+        return None
+    item = _object(collection_value, "collection.hubbleFlowCollection", errors)
+    status = _required_string(
+        item.get("status"), "collection.hubbleFlowCollection.status", errors
+    )
+    if status not in {"complete", "incomplete"}:
+        errors.append(
+            "collection.hubbleFlowCollection.status must be complete or incomplete"
+        )
+    issues = _normalize_collection_issues(
+        item.get("issues"),
+        status,
+        errors,
+        path="collection.hubbleFlowCollection.issues",
+    )
+    window = _object(
+        item.get("window"), "collection.hubbleFlowCollection.window", errors
+    )
+    start_source, start = _timestamp(
+        window.get("start"), "collection.hubbleFlowCollection.window.start", errors
+    )
+    end_source, end = _timestamp(
+        window.get("end"), "collection.hubbleFlowCollection.window.end", errors
+    )
+    del start_source, end_source
+    truncated = item.get("truncated", False)
+    if not isinstance(truncated, bool):
+        errors.append("collection.hubbleFlowCollection.truncated must be a boolean")
+        truncated = True
+    if not isinstance(flows_value, list):
+        errors.append("flows must be a list")
+        flows_value = []
+    if len(flows_value) > MAX_FLOWS:
+        raise EvidenceValidationError(
+            [f"flow count exceeds the {MAX_FLOWS}-flow limit"]
+        )
+    flows: list[Flow] = []
+    for index, value in enumerate(flows_value):
+        path = f"flows[{index}]"
+        flow = _object(value, path, errors)
+        _, timestamp = _timestamp(flow.get("timestamp"), f"{path}.timestamp", errors)
+        verdict = _safe_string(flow.get("verdict"), f"{path}.verdict", errors).upper()
+        direction = _optional_string(flow.get("direction"), f"{path}.direction", errors)
+        if direction is not None and direction not in {"ingress", "egress"}:
+            errors.append(f"{path}.direction must be ingress, egress, or null")
+        protocol = _optional_string(flow.get("protocol"), f"{path}.protocol", errors)
+        if protocol is not None:
+            protocol = protocol.upper()
+            if protocol not in {"TCP", "UDP", "SCTP", "ICMP", "ICMPV6"}:
+                errors.append(f"{path}.protocol is unsupported")
+        ports: list[int | None] = []
+        for field in ("sourcePort", "destinationPort"):
+            port = flow.get(field)
+            if port is not None and (
+                isinstance(port, bool)
+                or not isinstance(port, int)
+                or not 0 <= port <= 65535
+            ):
+                errors.append(
+                    f"{path}.{field} must be an integer from 0 to 65535 or null"
+                )
+                port = None
+            ports.append(port)
+        policy_related = flow.get("policyRelated")
+        if policy_related is not None and not isinstance(policy_related, bool):
+            errors.append(f"{path}.policyRelated must be a boolean or null")
+            policy_related = None
+        flows.append(
+            Flow(
+                timestamp,
+                verdict,
+                direction,
+                _normalize_flow_endpoint(flow.get("source"), f"{path}.source", errors),
+                _normalize_flow_endpoint(
+                    flow.get("destination"), f"{path}.destination", errors
+                ),
+                protocol,
+                ports[0],
+                ports[1],
+                _optional_string(flow.get("dropReason"), f"{path}.dropReason", errors),
+                policy_related,
+            )
+        )
+    unique = {flow: None for flow in flows}
+    normalized = tuple(sorted(unique, key=lambda flow: (flow.timestamp, repr(flow))))
+    completeness = [f"{issue.operation}: {issue.message}" for issue in issues]
+    verdicts_by_identity: dict[tuple[Any, ...], set[str]] = {}
+    for flow in normalized:
+        identity = (
+            flow.timestamp,
+            flow.direction,
+            flow.source,
+            flow.destination,
+            flow.protocol,
+            flow.source_port,
+            flow.destination_port,
+        )
+        verdicts_by_identity.setdefault(identity, set()).add(flow.verdict)
+    if any(len(verdicts) > 1 for verdicts in verdicts_by_identity.values()):
+        completeness.append("Hubble flow records contain contradictory verdicts")
+    if status != "complete":
+        completeness.append("Hubble flow collection status is incomplete")
+    if truncated:
+        completeness.append("Hubble flow collection was truncated")
+    if start and end and start >= end:
+        completeness.append("Hubble collection window is not increasing")
+    return FlowEvidence(
+        status,
+        issues,
+        start or None,
+        end or None,
+        normalized,
+        truncated,
+        tuple(completeness),
+    )
+
+
 def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
     """Validate and normalize a source-neutral evidence envelope."""
 
@@ -1169,6 +1316,7 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
         raw, collection, scope, errors
     )
     traffic = _normalize_traffic(raw, errors)
+    flow_evidence = _normalize_flow_evidence(raw, collection, errors)
 
     if errors:
         raise EvidenceValidationError(errors)
@@ -1238,6 +1386,7 @@ def normalize(raw: Mapping[str, Any]) -> EvidenceBundle:
         pod_evidence=pod_evidence,
         network_policy_evidence=network_policy_evidence,
         traffic=traffic,
+        flow_evidence=flow_evidence,
     )
 
 
@@ -1726,7 +1875,7 @@ def _network_policy_analysis(
     )
 
 
-def evaluate_service_no_ready_endpoints(
+def _evaluate_service_no_ready_endpoints(
     evidence: EvidenceBundle,
 ) -> DiagnosticReport:
     """Evaluate SERVICE_NO_READY_ENDPOINTS from normalized evidence."""
@@ -1963,6 +2112,185 @@ def evaluate_service_no_ready_endpoints(
         possible_causes=(*possible_causes, *policy_causes),
         confirmed_causes=confirmed_causes,
         limitations=(*limitations, *policy_limitations),
+    )
+
+
+def _flow_endpoint_matches_pod(endpoint: FlowEndpoint, pods: set[str]) -> bool:
+    return bool(endpoint.namespace and endpoint.pod_name) and (
+        f"{endpoint.namespace}/{endpoint.pod_name}" in pods
+    )
+
+
+def _flow_endpoint_identified(endpoint: FlowEndpoint) -> bool:
+    return (
+        endpoint.ip is not None
+        or endpoint.identity is not None
+        or bool(endpoint.namespace and endpoint.pod_name)
+    )
+
+
+def _hubble_analysis(
+    evidence: EvidenceBundle,
+) -> tuple[
+    tuple[ObservedEvidence, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    flow_evidence = evidence.flow_evidence
+    if flow_evidence is None:
+        return (), (), (), (), ()
+    limitations = list(flow_evidence.completeness_issues)
+    pod_evidence = evidence.pod_evidence
+    if pod_evidence is None or pod_evidence.completeness_issues:
+        limitations.append(
+            "Complete Pod evidence is required to correlate Hubble flows with the "
+            "Service."
+        )
+        return (), (), (), (), tuple(limitations)
+    service = evidence.service
+    if service is None or service.selector is None:
+        limitations.append(
+            "A selector-based Service is required for Pod flow correlation."
+        )
+        return (), (), (), (), tuple(limitations)
+    pod_ids = {
+        pod.identity
+        for pod in (pod_evidence.pods or ())
+        if _pod_matches_selector(pod, service)
+    }
+    matched: list[Flow] = []
+    skipped = 0
+    for flow in flow_evidence.flows:
+        if (
+            flow_evidence.window_start and flow.timestamp < flow_evidence.window_start
+        ) or (flow_evidence.window_end and flow.timestamp > flow_evidence.window_end):
+            skipped += 1
+            continue
+        if evidence.traffic is None:
+            relevant = _flow_endpoint_matches_pod(flow.source, pod_ids) or (
+                _flow_endpoint_matches_pod(flow.destination, pod_ids)
+            )
+        elif evidence.traffic.direction == "ingress":
+            relevant = _flow_endpoint_matches_pod(flow.destination, pod_ids)
+        else:
+            relevant = _flow_endpoint_matches_pod(flow.source, pod_ids)
+        if evidence.traffic is not None:
+            traffic = evidence.traffic
+            relevant = relevant and flow.direction == traffic.direction
+            relevant = relevant and flow.protocol == traffic.protocol
+            relevant = relevant and flow.destination_port == traffic.port
+            peer = flow.source if traffic.direction == "ingress" else flow.destination
+            if traffic.peer.namespace is not None:
+                relevant = relevant and peer.namespace == traffic.peer.namespace
+            if traffic.peer.ip is not None:
+                relevant = relevant and peer.ip == traffic.peer.ip
+        if relevant:
+            matched.append(flow)
+        else:
+            skipped += 1
+    forwarded = sum(flow.verdict in {"FORWARDED", "REDIRECTED"} for flow in matched)
+    dropped = sum(flow.verdict == "DROPPED" for flow in matched)
+    policy_drops = sum(
+        flow.verdict == "DROPPED" and flow.policy_related is True for flow in matched
+    )
+    confirmable_policy_drops = sum(
+        flow.verdict == "DROPPED"
+        and flow.policy_related is True
+        and flow.direction is not None
+        and flow.protocol is not None
+        and flow.destination_port is not None
+        and _flow_endpoint_identified(flow.source)
+        and _flow_endpoint_identified(flow.destination)
+        for flow in matched
+    )
+    observation = ObservedEvidence(
+        statement=(
+            f"Hubble observed {len(matched)} matching flows in the bounded window: "
+            f"{forwarded} forwarded and {dropped} dropped"
+        ),
+        source="hubble",
+        source_collected_at=flow_evidence.window_end or evidence.source_collected_at,
+        collected_at=evidence.collected_at,
+        resource=f"HubbleFlowWindow/{flow_evidence.window_start}..{flow_evidence.window_end}",
+        transformations=(
+            "projected metadata-only Hubble flow fields",
+            "deduplicated identical records and correlated Service-selected Pods",
+        ),
+    )
+    findings: list[str] = []
+    possible: list[str] = []
+    confirmed: list[str] = []
+    if not matched:
+        findings.append("No matching Hubble flows were observed in the bounded window.")
+        limitations.append(
+            "Absence of observed flows does not prove that traffic did not occur."
+        )
+    if forwarded:
+        findings.append(f"Hubble reported {forwarded} matching forwarded flows.")
+        limitations.append("A forwarded flow does not prove application-level success.")
+    if dropped:
+        findings.append(f"Hubble reported {dropped} matching dropped flows.")
+        possible.append(
+            "Observed packet drops may explain the described communication failure."
+        )
+    if policy_drops:
+        statement = (
+            f"Hubble explicitly classified {policy_drops} matching drops as "
+            "policy-related."
+        )
+        findings.append(statement)
+        if not flow_evidence.completeness_issues and confirmable_policy_drops:
+            confirmed.append(
+                f"Hubble explicitly classified {confirmable_policy_drops} fully "
+                "correlated matching drops as policy-related."
+            )
+        if flow_evidence.completeness_issues or confirmable_policy_drops < policy_drops:
+            possible.append("Policy-related Hubble drops may explain the failure.")
+            limitations.append(
+                "A definitive Hubble policy-drop condition requires complete source, "
+                "destination, direction, protocol, and port evidence."
+            )
+    if dropped > policy_drops:
+        limitations.append(
+            "A dropped verdict without explicit policy metadata is not attributed "
+            "to NetworkPolicy."
+        )
+    if skipped:
+        limitations.append(
+            f"{skipped} collected flows did not match the available Service and "
+            "traffic context."
+        )
+    return (
+        (observation,),
+        tuple(findings),
+        tuple(possible),
+        tuple(confirmed),
+        tuple(limitations),
+    )
+
+
+def evaluate_service_no_ready_endpoints(evidence: EvidenceBundle) -> DiagnosticReport:
+    """Evaluate the primary rule and enrich it with optional Hubble evidence."""
+
+    report = _evaluate_service_no_ready_endpoints(evidence)
+    observations, findings, possible, confirmed, limitations = _hubble_analysis(
+        evidence
+    )
+    issues = (
+        evidence.flow_evidence.collection_issues
+        if evidence.flow_evidence is not None
+        else ()
+    )
+    return replace(
+        report,
+        collection_issues=(*report.collection_issues, *issues),
+        observed_evidence=(*report.observed_evidence, *observations),
+        derived_findings=(*report.derived_findings, *findings),
+        possible_causes=(*report.possible_causes, *possible),
+        confirmed_causes=(*report.confirmed_causes, *confirmed),
+        limitations=(*report.limitations, *limitations),
     )
 
 
