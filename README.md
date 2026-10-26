@@ -216,17 +216,35 @@ container-port mappings.
 
 ### Hubble flow analysis
 
-KubeTrace correlates a bounded Hubble window with observed Pods selected by the
-Service and, when supplied, the traffic direction, protocol, destination port,
-peer namespace, and peer IP. It reports matching forwarded and dropped verdicts.
-Only a dropped verdict carrying explicit Hubble policy metadata supports a
-confirmed immediate policy-drop condition. Generic drops remain unattributed,
-and policy objects alone are not used to relabel them.
+KubeTrace correlates a bounded Hubble window with the target Service using
+complete Service-selected Pod identities and associated EndpointSlice IPs. When
+both identifiers are present they must agree. Optional traffic direction,
+protocol, destination port, peer namespace, and peer IP further constrain the
+match. Flow and Kubernetes collection windows must overlap.
+
+The report keeps each source's provenance and can describe combined conditions,
+including ready endpoints with relevant drops, unready Pods with relevant
+drops, or forwarded traffic observed alongside a no-ready-endpoints finding.
+These are correlations between bounded observations, not causal conclusions.
+The primary outcome continues to describe `SERVICE_NO_READY_ENDPOINTS`; flow
+findings can therefore accompany either `finding` or `no_finding`.
+
+Only a dropped verdict carrying explicit Hubble policy-denial metadata supports
+a confirmed immediate policy-drop condition. When Kubernetes NetworkPolicy
+evaluation independently suggests the same restriction, KubeTrace reports the
+agreement but does not claim that a particular policy object caused the drop.
+If policy specifications allow the described traffic, the disagreement is
+reported with possible snapshot, alternate-policy-source, and enforcement
+limitations. Generic drops remain unattributed, and matching policy selectors
+alone are never treated as proof of a denial.
 
 An empty flow window means that no matching flow was observed; it does not prove
 that traffic did not occur. A forwarded verdict does not prove application-level
 success. Unavailable, malformed, oversized, timed-out, or truncated Hubble
 collection is reported as incomplete and cannot confirm a Hubble-derived cause.
+Flows outside the declared window, non-overlapping source snapshots, missing
+identities, and conflicting Pod-name/IP associations are excluded from strong
+conclusions and recorded as limitations.
 
 Diagnostic outcomes are:
 

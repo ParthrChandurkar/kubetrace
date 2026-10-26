@@ -72,8 +72,10 @@ def response(*, verdict: str = "DROPPED", policy: str | None = "L3_L4") -> str:
 
 def collect(result: str | bytes | Exception, **budgets: Any) -> dict[str, Any]:
     client = FakeHubble(result)
+    evidence = base_evidence()
+    evidence["collection"]["collectedAt"] = "2026-10-26T12:00:00Z"
     collector = HubbleCollector(
-        StaticCollector(base_evidence()), client, lambda: NOW, **budgets
+        StaticCollector(evidence), client, lambda: NOW, **budgets
     )
     evidence = dict(collector.collect())
     assert client.requests[0].start.isoformat() == "2026-10-26T11:59:00+00:00"
